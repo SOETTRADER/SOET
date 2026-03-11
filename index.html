@@ -13,33 +13,18 @@
   <title>SOET Trading Hub</title>
   <link rel="manifest" href="manifest.json">
   <style>
-    body {
-      margin: 0;
-      background-color: #0A0E1A;
-    }
+    body { margin: 0; background-color: #0A0E1A; }
     #loading {
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      height: 100vh;
-      flex-direction: column;
-      color: #1DE9B6;
-      font-family: Arial, sans-serif;
-      background-color: #0A0E1A;
+      display: flex; justify-content: center; align-items: center;
+      height: 100vh; flex-direction: column;
+      color: #1DE9B6; font-family: Arial, sans-serif; background-color: #0A0E1A;
     }
     .spinner {
-      width: 50px;
-      height: 50px;
-      border: 4px solid #1a2744;
-      border-top: 4px solid #1DE9B6;
-      border-radius: 50%;
-      animation: spin 1s linear infinite;
-      margin-bottom: 20px;
+      width: 50px; height: 50px;
+      border: 4px solid #1a2744; border-top: 4px solid #1DE9B6;
+      border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 20px;
     }
-    @keyframes spin {
-      0% { transform: rotate(0deg); }
-      100% { transform: rotate(360deg); }
-    }
+    @keyframes spin { 0%{transform:rotate(0deg);} 100%{transform:rotate(360deg);} }
   </style>
 </head>
 <body>
@@ -49,10 +34,79 @@
   </div>
 
   <script>
-    // Hide loading screen once Flutter is ready
+    // Hide loading screen
     window.addEventListener('flutter-first-frame', function() {
-      var loading = document.getElementById('loading');
-      if (loading) loading.style.display = 'none';
+      var el = document.getElementById('loading');
+      if (el) el.style.display = 'none';
+    });
+
+    // Prevent reload on app switch
+    document.addEventListener('visibilitychange', function() {
+      if (document.visibilityState === 'visible') {
+        console.log('SOET resumed');
+      }
+    });
+
+    // ── SOUND ENGINE ──
+    var audioCtx = null;
+    var audioUnlocked = false;
+
+    function unlockAudio() {
+      if (audioUnlocked) return;
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        var buf = audioCtx.createBuffer(1, 1, 22050);
+        var src = audioCtx.createBufferSource();
+        src.buffer = buf;
+        src.connect(audioCtx.destination);
+        src.start(0);
+        audioUnlocked = true;
+      } catch(e) {}
+    }
+
+    // Unlock on any touch or click
+    document.addEventListener('click',      unlockAudio);
+    document.addEventListener('touchstart', unlockAudio);
+    document.addEventListener('touchend',   unlockAudio);
+
+    function getCtx() {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      return audioCtx;
+    }
+
+    function playBeep(freq, dur, vol, delay) {
+      try {
+        var ctx = getCtx();
+        var osc = ctx.createOscillator();
+        var gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        var t = ctx.currentTime + (delay || 0);
+        gain.gain.setValueAtTime(vol, t);
+        gain.gain.linearRampToValueAtTime(0.001, t + dur);
+        osc.start(t);
+        osc.stop(t + dur + 0.05);
+      } catch(e) {}
+    }
+
+    // Listen for postMessage from Flutter
+    window.addEventListener('message', function(e) {
+      if (!e.data || !e.data.soet_sound) return;
+      unlockAudio();
+      var type = e.data.soet_sound;
+      if (type === 'win') {
+        playBeep(523, 0.15, 0.4, 0);
+        playBeep(784, 0.25, 0.4, 0.2);
+      } else if (type === 'loss') {
+        playBeep(280, 0.15, 0.3, 0);
+        playBeep(180, 0.3,  0.25, 0.15);
+      } else if (type === 'signal') {
+        playBeep(880, 0.08, 0.25, 0);
+        playBeep(660, 0.08, 0.2,  0.1);
+      }
     });
   </script>
 
