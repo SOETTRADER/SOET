@@ -1,46 +1,179 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <!--
-    If you are serving your web app in a path other than the root, change the
-    href value below to reflect the base path you are serving from.
-
-    The path provided below has to start and end with a slash "/" in order for
-    it to work correctly.
-
-    For more details:
-    * https://developer.mozilla.org/en-US/docs/Web/HTML/Element/base
-
-    This is a placeholder for base href that will be replaced by the value of
-    the `--base-href` argument provided to `flutter build`.
-  -->
   <base href="/SOET/">
-
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
-  <meta name="description" content="A new Flutter project.">
-
-  <!-- iOS meta tags & icons -->
-  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="description" content="SOET - Smart Options & Events Trader">
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
-  <meta name="apple-mobile-web-app-title" content="soet">
-  <link rel="apple-touch-icon" href="icons/Icon-192.png">
-
-  <!-- Favicon -->
-  <link rel="icon" type="image/png" href="favicon.png"/>
-
-  <title>soet</title>
+  <meta name="apple-mobile-web-app-title" content="SOET">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
+  <meta name="theme-color" content="#060B18">
+  <title>SOET Trading Hub</title>
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <style>
+    * { font-family: 'Montserrat', sans-serif !important; }
+  </style>
   <link rel="manifest" href="manifest.json">
+  <style>
+    body { margin: 0; background-color: #0A0E1A; }
+    #loading {
+      display: flex; justify-content: center; align-items: center;
+      height: 100vh; flex-direction: column;
+      color: #1DE9B6; font-family: Arial, sans-serif; background-color: #0A0E1A;
+    }
+    .spinner {
+      width: 50px; height: 50px;
+      border: 4px solid #1a2744; border-top: 4px solid #1DE9B6;
+      border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 20px;
+    }
+    @keyframes spin { 0%{transform:rotate(0deg);} 100%{transform:rotate(360deg);} }
+  </style>
 </head>
 <body>
-  <!--
-    You can customize the "flutter_bootstrap.js" script.
-    This is useful to provide a custom configuration to the Flutter loader
-    or to give the user feedback during the initialization process.
+  <div id="loading">
+    <div class="spinner"></div>
+    <p>Loading SOET...</p>
+  </div>
+  <script>
+    window.addEventListener('flutter-first-frame', function() {
+      var el = document.getElementById('loading');
+      if (el) el.style.display = 'none';
+    });
 
-    For more details:
-    * https://docs.flutter.dev/platform-integration/web/initialization
-  -->
+    // Prevent reload on app switch
+    document.addEventListener('visibilitychange', function() {
+      if (document.visibilityState === 'visible') { console.log('SOET resumed'); }
+    });
+
+    // Sound engine
+    var audioCtx = null;
+    var audioUnlocked = false;
+
+    function unlockAudio() {
+      if (audioUnlocked) return;
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        var buf = audioCtx.createBuffer(1,1,22050);
+        var src = audioCtx.createBufferSource();
+        src.buffer = buf; src.connect(audioCtx.destination); src.start(0);
+        audioUnlocked = true;
+      } catch(e) {}
+    }
+
+    document.addEventListener('click', unlockAudio);
+    document.addEventListener('touchstart', unlockAudio);
+    document.addEventListener('touchend', unlockAudio);
+
+    function getCtx() {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      return audioCtx;
+    }
+
+    function playBeep(freq, dur, vol, delay) {
+      try {
+        var ctx = getCtx();
+        var osc = ctx.createOscillator();
+        var gain = ctx.createGain();
+        osc.connect(gain); gain.connect(ctx.destination);
+        osc.type = 'sine'; osc.frequency.value = freq;
+        var t = ctx.currentTime + (delay||0);
+        gain.gain.setValueAtTime(vol, t);
+        gain.gain.linearRampToValueAtTime(0.001, t+dur);
+        osc.start(t); osc.stop(t+dur+0.05);
+      } catch(e) {}
+    }
+
+    // Listen for string messages from Flutter
+    window.addEventListener('message', function(e) {
+      if (typeof e.data !== 'string') return;
+
+      // Firebase sync
+      if (e.data.startsWith('soet_fb:')) {
+        var rest = e.data.substring(8); // POST:url:body
+        var method = rest.substring(0, rest.indexOf(':'));
+        var remainder = rest.substring(rest.indexOf(':')+1);
+        var urlEnd = remainder.indexOf(':{"');
+        if (urlEnd < 0) return;
+        var url  = remainder.substring(0, urlEnd);
+        var body = remainder.substring(urlEnd+1);
+        fetch(url, { method: method, headers: {'Content-Type':'application/json'}, body: body })
+          .catch(function(err){ console.log('FB error:', err); });
+        return;
+      }
+
+      // Firebase pull trades
+      if (e.data.startsWith('soet_fb_pull:')) {
+        var parts = e.data.substring(13).split(':');
+        var accountId = parts[0];
+        var url = parts.slice(1).join(':');
+        fetch(url + '&orderBy=fields.account&equalTo=' + accountId)
+          .then(function(r){ return r.json(); })
+          .then(function(data){
+            window.dispatchEvent(new CustomEvent('soet_fb_result', {detail: JSON.stringify(data)}));
+          }).catch(function(err){ console.log('FB pull error:', err); });
+        return;
+      }
+
+      // Telegram alert via JS fetch (bypasses CORS)
+      if (e.data.startsWith('soet_tg:')) {
+        var parts = e.data.substring(8).split(':body:');
+        // format: soet_tg:URL:BODY
+        var idx = e.data.indexOf(':');        // first : after soet_tg
+        var rest = e.data.substring(idx+1);  // url:body
+        var urlEnd = rest.indexOf(':{"');
+        if (urlEnd < 0) return;
+        var url  = rest.substring(0, urlEnd);
+        var body = rest.substring(urlEnd+1);
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: body
+        }).catch(function(err){ console.log('TG error:', err); });
+        return;
+      }
+
+      // CSV Download
+      if (e.data.startsWith('soet_download:')) {
+        var parts = e.data.substring(14).split(':');
+        var filename = parts[0];
+        var content = parts.slice(1).join(':');
+        var blob = new Blob([content], {type: 'text/csv'});
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url; a.download = filename;
+        document.body.appendChild(a); a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        return;
+      }
+
+      if (!e.data.startsWith('soet_sound:')) return;
+      unlockAudio();
+      var type = e.data.split(':')[1];
+      if (type === 'win') {
+        playBeep(523, 0.15, 0.4, 0);
+        playBeep(784, 0.25, 0.4, 0.2);
+      } else if (type === 'loss') {
+        playBeep(280, 0.15, 0.3, 0);
+        playBeep(180, 0.3, 0.25, 0.15);
+      } else if (type === 'signal') {
+        playBeep(880, 0.08, 0.25, 0);
+        playBeep(660, 0.08, 0.2, 0.1);
+      }
+    });
+  </script>
+  <script>
+    // Unregister old service workers that might cache broken files
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then(function(registrations) {
+        for(let registration of registrations) { registration.unregister(); }
+      });
+    }
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>
