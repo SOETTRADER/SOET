@@ -37,6 +37,15 @@ class DerivService {
   Function(String)? onError;
   Function()?       onConnected;
   Function()?       onDisconnected;
+  // Per-contract completers — each bot registers its own
+  final Map<String, Completer<Map>> _contractCompleters = {};
+
+  void registerContractCompleter(String cid, Completer<Map> comp) {
+    _contractCompleters[cid] = comp;
+  }
+  void unregisterContractCompleter(String cid) {
+    _contractCompleters.remove(cid);
+  }
   Function(Map)?    onContract;
   Function(String)? onTradeError;
   Function()?       onReconnecting;
@@ -95,7 +104,20 @@ class DerivService {
 
     // ── CONTRACT RESULT: always route first, never swallow in pending ──
     if (msgType == 'proposal_open_contract' && d['proposal_open_contract'] != null) {
-      onContract?.call(Map.from(d['proposal_open_contract'] as Map));
+      final contractData = Map<String,dynamic>.from(d['proposal_open_contract'] as Map);
+      final cid = contractData['contract_id']?.toString() ?? '';
+      // Dispatch to per-contract completer if registered (for bots)
+      if (cid.isNotEmpty && _contractCompleters.containsKey(cid)) {
+        final status = contractData['status']?.toString() ?? '';
+        final isSold = contractData['is_sold'];
+        final settled = isSold==1 || isSold==true || status=='won' || status=='lost';
+        if (settled) {
+          _contractCompleters[cid]?.complete(contractData);
+          _contractCompleters.remove(cid);
+        }
+        return; // Don't pass to onContract — bot handles it
+      }
+      onContract?.call(contractData);
       return;
     }
 
@@ -146,10 +168,18 @@ class DerivService {
     // proposal and buy are handled via pending completers above — nothing else needed
   }
 
-  Future<Map?> getProposal({required String symbol, required String contractType, required double amount, int? barrier}) async {
+  Future<Map?> getTickHistory(String symbol, int count) async {
+    final id = _nextId;
+    final comp = Completer<Map>();
+    _pending[id] = comp;
+    _send({'ticks_history':symbol,'count':count,'end':'latest','style':'ticks','req_id':id});
+    try { return await comp.future.timeout(const Duration(seconds:8)); } catch(_) { return null; }
+  }
+
+  Future<Map?> getProposal({required String symbol, required String contractType, required double amount, int? barrier, int duration=1}) async {
     if (!_connected) return null;
     final id = _nextId;
-    final req = <String,dynamic>{'proposal':1,'amount':amount,'basis':'stake','contract_type':contractType,'currency':'USD','duration':1,'duration_unit':'t','symbol':symbol,'req_id':id}; // duration kept at 1t — digit contracts always 1 tick
+    final req = <String,dynamic>{'proposal':1,'amount':amount,'basis':'stake','contract_type':contractType,'currency':'USD','duration':duration,'duration_unit':'t','symbol':symbol,'req_id':id};
     if (barrier != null) req['barrier'] = barrier;
     final comp = Completer<Map>(); _pending[id] = comp; _send(req);
     return comp.future.timeout(const Duration(seconds: 5), onTimeout: () => {});
@@ -172,8 +202,7 @@ class DerivService {
   // Standard volatility (R_10 etc.) = price is constant, needs ticks_history to stream
   // 1s volatility (1HZ10V etc.), Jump (JD), Boom/Crash = plain ticks subscribe works
   bool _usePlainTicks(String symbol) =>
-    symbol.startsWith('1HZ') || symbol.startsWith('JD') ||
-    symbol.startsWith('BOOM_') || symbol.startsWith('CRASH_');
+    symbol.startsWith('1HZ') || symbol.startsWith('JD');
 
   void subscribeTicks(String symbol) {
     if (!_connected) return;
@@ -214,14 +243,35 @@ void main() {
   runApp(const SOETApp());
 }
 
-class SOETApp extends StatelessWidget {
+class SOETApp extends StatefulWidget {
   const SOETApp({super.key});
+  @override State<SOETApp> createState() => SOETAppState();
+  static SOETAppState? of(BuildContext context) => context.findAncestorStateOfType<SOETAppState>();
+}
+class SOETAppState extends State<SOETApp> {
+  bool isDark = true;
+  void toggleTheme() => setState(() => isDark = !isDark);
+
   @override
-  Widget build(BuildContext context) => MaterialApp(
-    title: 'SOET', debugShowCheckedModeBanner: false,
-    theme: ThemeData.dark().copyWith(scaffoldBackgroundColor: const Color(0xFF060B18)),
-    home: const SplashScreen(),
-  );
+  Widget build(BuildContext context) {
+    final dark = ThemeData.dark().copyWith(
+      scaffoldBackgroundColor: const Color(0xFF060B18),
+      colorScheme: const ColorScheme.dark(primary: Color(0xFF1DE9B6)),
+      textTheme: ThemeData.dark().textTheme.apply(fontFamily: 'Montserrat'),
+    );
+    final light = ThemeData.light().copyWith(
+      scaffoldBackgroundColor: const Color(0xFFF0F4F8),
+      colorScheme: const ColorScheme.light(primary: Color(0xFF00897B)),
+      cardColor: Colors.white,
+      appBarTheme: const AppBarTheme(backgroundColor: Colors.white, foregroundColor: Colors.black),
+      textTheme: ThemeData.light().textTheme.apply(fontFamily: 'Montserrat'),
+    );
+    return MaterialApp(
+      title: 'SOET', debugShowCheckedModeBanner: false,
+      theme: isDark ? dark : light,
+      home: const SplashScreen(),
+    );
+  }
 }
 
 class SplashScreen extends StatefulWidget {
@@ -479,6 +529,17 @@ class SOETHome extends StatefulWidget {
 class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
   int _tab = 0;
 
+  // Theme helpers — use these instead of hardcoded colors
+  bool get _isDark => SOETApp.of(context)?.isDark ?? true;
+  Color get _bg        => _isDark ? const Color(0xFF060B18) : const Color(0xFFF0F4F8);
+  Color get _card      => _isDark ? const Color(0xFF0D1421) : Colors.white;
+  Color get _cardBorder=> _isDark ? const Color(0xFF1A2640) : const Color(0xFFDDE3ED);
+  Color get _textPrim  => _isDark ? Colors.white : const Color(0xFF1A2640);
+  Color get _textSec   => _isDark ? Colors.grey  : const Color(0xFF6B7280);
+  Color get _accent    => const Color(0xFF1DE9B6);
+  Color get _green     => const Color(0xFF00C853);
+  Color get _red       => const Color(0xFFFF4444);
+
   // Account
   String _balance = '...', _currency = 'USD', _loginId = '';
 
@@ -487,6 +548,194 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
   double _price = 0;
   int    _lastDigit = 0;
   List<int>    _hist       = [];
+
+  // ── SMART MARKET BOT ────────────────────────────────
+  bool   _smartBotOn    = false;
+  String _smartBotMsg   = 'Smart bot ready';
+  Color  _smartBotMsgC  = Colors.grey;
+  double _smartBotStake = 1.0;
+  double _smartBotTP    = 0;   // 0 = disabled
+  double _smartBotSL    = 0;   // 0 = disabled
+  bool   _smartBotTPon  = false;
+  bool   _smartBotSLon  = false;
+  int    _smartBotCount = 0;
+  int    _smartBotWins  = 0;
+  double _smartBotPnl   = 0;
+
+  Future<void> _runSmartBot() async {
+    setState(()=>_smartBotOn=true);
+    while(_smartBotOn && mounted) {
+      // Step 1: Scan all markets to find the best one
+      setState(()=>_smartBotMsg='🔍 Scanning markets...');
+      await _runMultiMarketAnalysis();
+      if (!_smartBotOn || !mounted) break;
+
+      if (_bestMarket.isEmpty) {
+        setState(()=>_smartBotMsg='⏳ No strong signal found — waiting...');
+        await Future.delayed(const Duration(seconds:10));
+        continue;
+      }
+
+      // Step 2: Get best LOW/MEDIUM risk market only
+      // Filter out HIGH and EXTREME risk markets for smart bot
+      final safeMarkets = _marketScores.entries.where((e){
+        final r = e.value['risk']?.toString() ?? 'LOW';
+        return r == 'LOW' || r == 'MEDIUM';
+      }).toList();
+      if(safeMarkets.isNotEmpty){
+        safeMarkets.sort((a,b)=>(b.value['score'] as int).compareTo(a.value['score'] as int));
+        _bestMarket = safeMarkets.first.key;
+        _bestMarketSignal = safeMarkets.first.value['signal'] as String;
+      }
+      final bestScore = _marketScores[_bestMarket]?['score'] as int? ?? 0;
+      if (bestScore < 50) {
+        setState(()=>_smartBotMsg='😴 Signals too weak ($bestScore%) — waiting...');
+        await Future.delayed(const Duration(seconds:15));
+        continue;
+      }
+
+      final bestName = _marketScores[_bestMarket]?['name'] ?? _bestMarket;
+      final hotDigit = _marketScores[_bestMarket]?['hot'] ?? 0;
+      setState(()=>_smartBotMsg='✅ Best: $bestName (score:$bestScore) — trading...');
+
+      // Step 3: Place trade on best market using DIFFERS on hot digit
+      try {
+        final prop = await deriv.getProposal(
+          symbol:_bestMarket, contractType:'DIGITDIFF',
+          amount:_smartBotStake, barrier:hotDigit, duration:1);
+        if(prop==null||prop['proposal']==null){ await Future.delayed(const Duration(seconds:3)); continue; }
+        final pid = prop['proposal']['id']?.toString()??'';
+        if(pid.isEmpty){ await Future.delayed(const Duration(seconds:3)); continue; }
+        final buy = await deriv.buyContract(pid, _smartBotStake);
+        if(buy==null||buy['buy']==null){ await Future.delayed(const Duration(seconds:3)); continue; }
+        final cid = buy['buy']['contract_id']?.toString()??'';
+        if(cid.isNotEmpty){
+          final comp = Completer<Map>();
+          deriv.registerContractCompleter(cid, comp);
+          deriv.subscribeContract(cid);
+          final result = await comp.future.timeout(const Duration(seconds:20),onTimeout:()=>{});
+          deriv.unregisterContractCompleter(cid);
+          if(!mounted) break;
+          final profit=(result['profit'] as num?)?.toDouble()??0;
+          final won = (result['status']?.toString()??'')=='won' || profit>0;
+          final sbEntry = result['entry_spot']?.toString() ?? result['entry_tick_display_value']?.toString() ?? '';
+          final sbExit  = result['exit_tick_display_value']?.toString() ?? result['sell_spot']?.toString() ?? '';
+          setState((){
+            _smartBotCount++;
+            if(won) _smartBotWins++;
+            _smartBotPnl+=profit;
+            _smartBotMsg=won
+              ?'✅ WIN +\$'+profit.toStringAsFixed(2)+' on '+bestName
+              :'❌ LOSS -\$'+profit.abs().toStringAsFixed(2)+' on '+bestName;
+            _smartBotMsgC=won?_green:_red;
+          });
+          _logTrade(market:bestName,type:'DIFFERS '+hotDigit.toString(),stake:_smartBotStake,won:won,profit:profit,entrySpot:sbEntry,exitSpot:sbExit);
+          _playSound(won);
+          // Check smart bot SL/TP
+          if (_smartBotTPon && _smartBotTP > 0 && _smartBotPnl >= _smartBotTP) {
+            setState((){_smartBotOn=false; _smartBotMsg='🎯 TP Hit! +\$'+_smartBotPnl.toStringAsFixed(2); _smartBotMsgC=_green;});
+            break;
+          }
+          if (_smartBotSLon && _smartBotSL > 0 && _smartBotPnl <= -_smartBotSL) {
+            setState((){_smartBotOn=false; _smartBotMsg='🛑 SL Hit! \$'+_smartBotPnl.toStringAsFixed(2); _smartBotMsgC=_red;});
+            break;
+          }
+        }
+      } catch(e) { if(mounted) setState(()=>_smartBotMsg='⚠️ Error — retrying...'); }
+      await Future.delayed(const Duration(milliseconds:2000));
+    }
+    if(mounted) setState(()=>_smartBotOn=false);
+  }
+
+  // ── MULTI-MARKET ANALYZER ───────────────────────────
+  // Stores last analysis result per market
+  final Map<String,Map<String,dynamic>> _marketScores = {};
+  bool _analyzing = false;
+  String _bestMarket = '';
+  String _bestMarketSignal = '';
+
+  // Analyze a market by fetching its tick history and computing signal strength
+  Future<Map<String,dynamic>> _analyzeMarket(String symbol, String name, {String risk='LOW'}) async {
+    try {
+      final result = await deriv.getTickHistory(symbol, 100);
+      if (result == null) return {'symbol':symbol,'name':name,'score':0,'signal':'No data','color':0xFF888888};
+      // Deriv ticks_history response: {'ticks_history': ..., 'history': {'prices': [], 'times': []}}
+      final histData = result['history'] ?? result['ticks_history'];
+      final prices = (histData is Map ? (histData['prices'] as List?) : null)?.cast<num>() ?? [];
+      if (prices.length < 20) return {'symbol':symbol,'name':name,'score':0,'signal':'Insufficient data','color':0xFF888888};
+      // Extract digits
+      final digits = prices.map((p){
+        final s = p.toDouble().toString();
+        final dot = s.indexOf('.');
+        if (dot < 0) return p.toInt() % 10;
+        final dec = s.substring(dot+1).replaceAll(RegExp(r'0+\$'),'');
+        return dec.isEmpty ? 0 : int.tryParse(dec[dec.length-1]) ?? 0;
+      }).toList();
+      // Frequency analysis
+      final freq = <int,int>{for(int i=0;i<=9;i++) i:0};
+      for(final d in digits) freq[d] = (freq[d]??0)+1;
+      final total = digits.length;
+      final mx = freq.values.reduce((a,b)=>a>b?a:b);
+      final mn = freq.values.reduce((a,b)=>a<b?a:b);
+      final hot = freq.entries.firstWhere((e)=>e.value==mx).key;
+      final cold = freq.entries.firstWhere((e)=>e.value==mn).key;
+      final hotPct = mx/total*100;
+      final coldPct = mn/total*100;
+      // Recent momentum (last 10)
+      final recent = digits.sublist(digits.length-10);
+      final recentOver = recent.where((d)=>d>4).length;
+      final bias = (recentOver/10-0.5).abs();
+      final hotScore = ((hotPct-10)/10*100).clamp(0.0,100.0);
+      final coldScore = ((10-coldPct)/10*100).clamp(0.0,100.0);
+      final momentumScore = (bias*200).clamp(0.0,100.0);
+      final rawScore = ((hotScore + coldScore + momentumScore)/3);
+      // Risk penalty — high risk markets need stronger signal
+      final riskPenalty = risk=='LOW'?0:risk=='MEDIUM'?10:risk=='HIGH'?25:50;
+      final score = (rawScore - riskPenalty).clamp(0.0,100.0).round();
+      // Signal text
+      String signal; int color;
+      if (score >= 70) { signal='🔥 Strong — DIFFERS $hot'; color=0xFF00C853; }
+      else if (score >= 50) { signal='📊 Good — DIFFERS $hot'; color=0xFF1DE9B6; }
+      else if (score >= 30) { signal='⚡ Moderate'; color=0xFFFFD700; }
+      else { signal='😴 Weak signal'; color=0xFF888888; }
+      final riskColor = risk=='LOW'?0xFF00C853:risk=='MEDIUM'?0xFFFFD700:risk=='HIGH'?0xFFFF9800:0xFFFF4444;
+      return {'symbol':symbol,'name':name,'score':score,'signal':signal,'color':color,'hot':hot,'cold':cold,'hotPct':hotPct.toStringAsFixed(1),'risk':risk,'riskColor':riskColor};
+    } catch(e) {
+      return {'symbol':symbol,'name':name,'score':0,'signal':'Error','color':0xFF888888};
+    }
+  }
+
+  Future<void> _runMultiMarketAnalysis() async {
+    if (_analyzing) return;
+    setState(()=>_analyzing=true);
+    _marketScores.clear();
+    // Supported markets for digit trading (Vol + Jump only)
+    // Boom/Crash excluded — random spike structure not suitable for digit analysis
+    final markets = [
+      {'id':'R_10',    'name':'Vol 10',     'risk':'LOW'},
+      {'id':'R_25',    'name':'Vol 25',     'risk':'LOW'},
+      {'id':'1HZ10V',  'name':'Vol 10(1s)', 'risk':'LOW'},
+      {'id':'1HZ25V',  'name':'Vol 25(1s)', 'risk':'LOW'},
+      {'id':'R_50',    'name':'Vol 50',     'risk':'MEDIUM'},
+      {'id':'R_75',    'name':'Vol 75',     'risk':'MEDIUM'},
+      {'id':'1HZ50V',  'name':'Vol 50(1s)', 'risk':'MEDIUM'},
+      {'id':'R_100',   'name':'Vol 100',    'risk':'HIGH'},
+      {'id':'1HZ100V', 'name':'Vol 100(1s)','risk':'HIGH'},
+      {'id':'JD10',    'name':'Jump 10',    'risk':'HIGH'},
+      {'id':'JD25',    'name':'Jump 25',    'risk':'HIGH'},
+    ];
+    for (final m in markets) {
+      final result = await _analyzeMarket(m['id']!, m['name']!, risk:m['risk']??'LOW');
+      if (mounted) setState(()=>_marketScores[m['id']!]=result);
+    }
+    // Find best market
+    if (_marketScores.isNotEmpty) {
+      final best = _marketScores.entries.reduce((a,b)=>(a.value['score'] as int)>(b.value['score'] as int)?a:b);
+      _bestMarket = best.key;
+      _bestMarketSignal = best.value['signal'] as String;
+    }
+    if (mounted) setState(()=>_analyzing=false);
+  }
 
   // Dynamic hot/cold digits — computed live from frequency data
   int get _hotDigit  { if (_freq.isEmpty) return 0; final mx=_freq.values.reduce(max); return _freq.entries.firstWhere((e)=>e.value==mx).key; }
@@ -524,6 +773,7 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
 
   // Trade panel
   String _tType    = 'DIFFERS';
+  int    _tDuration = 1; // tick duration 1-10
   int    _tDigit   = 0;
   String _tBarrier = '5';
   double _tStake   = 1.0;
@@ -598,7 +848,7 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
     } catch(_) {}
   }
 
-  void _logTrade({required String market, required String type, required double stake, required bool won, required double profit}) {
+  void _logTrade({required String market, required String type, required double stake, required bool won, required double profit, String entrySpot='', String exitSpot=''}) {
     // Track signal accuracy + log signal history
     _sessionStart ??= DateTime.now();
     if (won) _sigWins++; else _sigLosses++;
@@ -607,19 +857,68 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
     }
     final now = DateTime.now();
     _tradeHistory.insert(0, {
-      'time':   '${now.hour.toString().padLeft(2,'0')}:${now.minute.toString().padLeft(2,'0')}:${now.second.toString().padLeft(2,'0')}',
-      'market': market,
-      'type':   type,
-      'stake':  stake,
-      'won':    won,
-      'profit': profit,
+      'time':       '${now.hour.toString().padLeft(2,'0')}:${now.minute.toString().padLeft(2,'0')}:${now.second.toString().padLeft(2,'0')}',
+      'market':     market,
+      'type':       type,
+      'stake':      stake,
+      'won':        won,
+      'profit':     profit,
+      'entrySpot':  entrySpot,
+      'exitSpot':   exitSpot,
     });
     if (_tradeHistory.length > 200) _tradeHistory.removeLast();
     _saveHistory(); // persist immediately
     _syncTradeToFirebase(_tradeHistory.first); // sync to Firebase
+    // Check session TP/SL after every trade
+    Future.microtask(_checkSessionLimits);
   }
 
   // ── BOT STATE ──────────────────────────────
+  // ── SESSION TP/SL ──────────────────────────────────
+  double _sessionTP   = 0;   // 0 = disabled
+  double _sessionSL   = 0;   // 0 = disabled
+  bool   _sessionTPon = false;
+  bool   _sessionSLon = false;
+  bool   _sessionHit  = false; // true when session limit was triggered
+  bool   _soundOn     = true;  // sound toggle
+
+  // ── RISK MANAGEMENT ──────────────────────────────
+  int    _maxTradesPerMin  = 3;    // max trades per minute per bot
+  int    _pauseAfterLosses = 3;    // pause bot after X consecutive losses
+  double _minConfidence    = 70.0; // only trade if signal confidence >= this
+  bool   _volatilityFilter = true; // skip trades during high volatility spikes
+  // Per-bot consecutive loss counter (already have _botConsecLoss)
+  final Map<String,DateTime> _botLastTradeTime = {};
+  final Map<String,int>      _botTradesThisMin = {};
+
+  // Check session TP/SL after every trade — stops all bots
+  void _checkSessionLimits() {
+    if (_sessionHit) return;
+    final pnl = _pnl; // computed getter from trade history
+    if (_sessionTPon && _sessionTP > 0 && pnl >= _sessionTP) {
+      _sessionHit = true;
+      _stopAllBots();
+      _showBotAlert('Session Target Hit! 🎯',
+        'All bots stopped. Profit target \$' + _sessionTP.toStringAsFixed(2) + ' reached! P/L: +\$' + pnl.toStringAsFixed(2),
+        const Color(0xFF1DE9B6), Icons.emoji_events_outlined);
+      if (_tgTpSlAlert) _sendTelegram('SOET Session TP Hit! Profit: +' + pnl.toStringAsFixed(2));
+    } else if (_sessionSLon && _sessionSL > 0 && pnl <= -_sessionSL) {
+      _sessionHit = true;
+      _stopAllBots();
+      _showBotAlert('Session Loss Limit Hit 🛑',
+        'All bots stopped. Loss limit \$' + _sessionSL.toStringAsFixed(2) + ' reached! P/L: \$' + pnl.toStringAsFixed(2),
+        const Color(0xFFFF4444), Icons.shield_outlined);
+      if (_tgTpSlAlert) _sendTelegram('SOET Session SL Hit! Loss: ' + pnl.toStringAsFixed(2));
+    }
+  }
+
+
+
+  // ── BOT TAB VIEW — DBot style
+  int _botTab = 0; // 0=Summary 1=Transactions
+  String _botRunning = ''; // which bot is active in focus view
+  bool _allBotsRunning = false;
+
   final Map<String,bool>   _botOn       = {'differs':false,'evenodd':false,'overunder':false,'matches':false};
   final Map<String,double> _botStake    = {'differs':1.0,  'evenodd':1.0,  'overunder':1.0,  'matches':1.0};
   final Map<String,int>    _botMax      = {'differs':10,   'evenodd':10,   'overunder':10,   'matches':10};
@@ -789,13 +1088,7 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
     {'g':'','id':'JD50', 'n':'Jump 50 Index'},
     {'g':'','id':'JD75', 'n':'Jump 75 Index'},
     {'g':'','id':'JD100','n':'Jump 100 Index'},
-    {'g':'BOOM & CRASH','id':'','n':''},
-    {'g':'','id':'BOOM_300',  'n':'Boom 300 Index'},
-    {'g':'','id':'BOOM_500',  'n':'Boom 500 Index'},
-    {'g':'','id':'BOOM_1000', 'n':'Boom 1000 Index'},
-    {'g':'','id':'CRASH_300', 'n':'Crash 300 Index'},
-    {'g':'','id':'CRASH_500', 'n':'Crash 500 Index'},
-    {'g':'','id':'CRASH_1000','n':'Crash 1000 Index'},
+
   ];
 
   // ── CONTRACT TYPE MAP ───────────────────────
@@ -938,7 +1231,18 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
           _tMsg = '❌  -\$${profit.abs().toStringAsFixed(2)}';
           _tColor = const Color(0xFFFF4444);
         }
-        _logTrade(market:_symName, type:_tType, stake:_tStake, won:won, profit:profit);
+        // Use actual contract type from data, not _tType default
+        final contractType = data['contract_type']?.toString() ?? _tType;
+        String tradeLabel = _tType;
+        if (contractType == 'DIGITOVER')  tradeLabel = 'OVER $_tBarrier';
+        else if (contractType == 'DIGITUNDER') tradeLabel = 'UNDER $_tBarrier';
+        else if (contractType == 'DIGITDIFF')  tradeLabel = 'DIFFERS $_tDigit';
+        else if (contractType == 'DIGITMATCH') tradeLabel = 'MATCHES $_tDigit';
+        else if (contractType == 'DIGITEVEN')  tradeLabel = 'EVEN';
+        else if (contractType == 'DIGITODD')   tradeLabel = 'ODD';
+        final entry = data['entry_spot']?.toString() ?? data['entry_tick_display_value']?.toString() ?? '';
+        final exit  = data['exit_tick_display_value']?.toString() ?? data['sell_spot']?.toString() ?? '';
+        _logTrade(market:_symName, type:tradeLabel, stake:_tStake, won:won, profit:profit, entrySpot:entry, exitSpot:exit);
       });
       _playSound(won);
     };
@@ -1112,7 +1416,7 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
     setState((){_tBusy=true; _tMsg='';});
     // Step 1: Get proposal (required by Deriv before buying)
     final prop = await deriv.getProposal(
-      symbol:_sym, contractType:_ctype(_tType), amount:_tStake, barrier:_barrier(),
+      symbol:_sym, contractType:_ctype(_tType), amount:_tStake, barrier:_barrier(), duration:_tDuration,
     );
     if (!mounted) return;
     if (prop==null || prop['proposal']==null) {
@@ -1136,6 +1440,7 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
 
   // ── SOUND ALERTS (via JS interop) ──────────
   void _playSound(bool won) {
+    if (!_soundOn) return;
     try {
       final msg = won ? 'soet_sound:win' : 'soet_sound:loss';
       html.window.postMessage(msg, '*');
@@ -1151,6 +1456,90 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
   void _logout() { _stopAllBots(); deriv.disconnect(); TokenStorage.clear(); Navigator.pushReplacement(context,MaterialPageRoute(builder:(_)=>const LoginScreen())); }
 
   // ── BOT LOGIC ──────────────────────────────
+  // ── RECOVERY MODE ──────────────────────────────────────
+  // After X consecutive losses, switch to safer strategy temporarily
+  final Map<String,int> _botConsecLoss = {'differs':0,'evenodd':0,'overunder':0,'matches':0};
+  final Map<String,bool> _botRecovery  = {'differs':false,'evenodd':false,'overunder':false,'matches':false};
+  bool _recoveryModeOn = false; // global toggle
+  int  _recoveryAfter  = 3;     // trigger after N consecutive losses
+  // In recovery: skip 2 trades, then resume with half stake
+
+  void _updateRecovery(String bot, bool won) {
+    if (!_recoveryModeOn) return;
+    if (won) {
+      _botConsecLoss[bot] = 0;
+      _botRecovery[bot]   = false;
+    } else {
+      _botConsecLoss[bot] = (_botConsecLoss[bot] ?? 0) + 1;
+      if ((_botConsecLoss[bot] ?? 0) >= _recoveryAfter) {
+        _botRecovery[bot] = true;
+      }
+    }
+  }
+
+  // ── VOLATILITY SPIKE DETECTOR ──────────────────────
+  // Returns true if market is spiking — skip trade
+  bool _isVolatilitySpike() {
+    if (!_volatilityFilter || _hist.length < 10) return false;
+    final recent = _hist.sublist(_hist.length - 10);
+    // Check if last 5 ticks are all same direction (extreme momentum)
+    int highCount = recent.where((d) => d > 7).length;
+    int lowCount  = recent.where((d) => d < 3).length;
+    // If 8+ of last 10 ticks are extreme — spike detected
+    if (highCount >= 8 || lowCount >= 8) return true;
+    return false;
+  }
+
+  // ── CONFIDENCE CHECK ─────────────────────────────────
+  // Returns signal confidence 0-100 based on current data
+  double _signalConfidence(String bot) {
+    if (_hist.length < 20) return 0;
+    final recent20 = _hist.sublist(_hist.length - 20);
+    final recent10 = _hist.sublist(_hist.length - 10);
+    switch(bot) {
+      case 'differs':
+        final freq = <int,int>{for(int i=0;i<=9;i++) i:0};
+        for(final d in recent20) freq[d] = (freq[d]??0)+1;
+        final mx = freq.values.reduce((a,b)=>a>b?a:b);
+        return (mx/recent20.length*100 - 10) * 5; // 15%->25 conf, 20%->50, 25%->75
+      case 'evenodd':
+        final ev = recent10.where((d)=>d%2==0).length;
+        final bias = (ev/10 - 0.5).abs();
+        return (bias * 200).clamp(0.0, 100.0);
+      case 'overunder':
+        int streak = 0;
+        for(int i=recent10.length-1;i>=0;i--){
+          if(i==recent10.length-1){ streak=1; continue; }
+          if((recent10[i]>4)==(recent10[i+1]>4)) streak++;
+          else break;
+        }
+        return (streak / 10 * 100).clamp(0.0, 100.0);
+      default: return 60;
+    }
+  }
+
+  // ── TRADE FREQUENCY GUARD ────────────────────────────
+  bool _canTradeNow(String bot) {
+    final now = DateTime.now();
+    final lastTime = _botLastTradeTime[bot];
+    if (lastTime != null) {
+      final diff = now.difference(lastTime).inSeconds;
+      if (diff < 60) {
+        final count = _botTradesThisMin[bot] ?? 0;
+        if (count >= _maxTradesPerMin) return false;
+      } else {
+        _botTradesThisMin[bot] = 0;
+      }
+    }
+    return true;
+  }
+
+  void _recordTrade(String bot) {
+    final now = DateTime.now();
+    _botLastTradeTime[bot] = now;
+    _botTradesThisMin[bot] = (_botTradesThisMin[bot] ?? 0) + 1;
+  }
+
   void _stopAllBots() {
     _botTimer?.cancel();
     for(final k in _botOn.keys) { _botOn[k]=false; _botBusy[k]=false; }
@@ -1167,12 +1556,14 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
 
       switch(bot) {
         case 'differs':
-          // Find hottest digit in recent 20 ticks — avoid it
+          // Find hottest digit — only enter if significantly above 10% expected
           final rf = <int,int>{for(int i=0;i<=9;i++) i:0};
           for(final d in recent20) rf[d]=(rf[d]??0)+1;
           final rmx = rf.values.reduce(max);
           final hotD = rf.entries.firstWhere((e)=>e.value==rmx).key;
-          return {'type':'DIGITDIFF','barrier':hotD,'label':'Differ $hotD'};
+          final hotFreqPct = rmx/recent20.length*100;
+          if(hotFreqPct < 15) return {'type':'SKIP','barrier':null,'label':'Waiting — no dominant digit yet...'};
+          return {'type':'DIGITDIFF','barrier':hotD,'label':'Differ $hotD (${hotFreqPct.toStringAsFixed(0)}%)'};
 
         case 'evenodd':
           if(recent.isEmpty) return {'type':'DIGITEVEN','barrier':null,'label':'Even'};
@@ -1189,18 +1580,23 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
             :{'type':'DIGITEVEN','barrier':null,'label':'Even'};
 
         case 'overunder':
-          if(recent.isEmpty) return {'type':'DIGITOVER','barrier':4,'label':'Over 4'};
-          // Use recent 10 ticks — trade against momentum
+          if(recent.isEmpty) return {'type':'DIGITDIFF','barrier':0,'label':'Waiting...'};
+          // Check CONSECUTIVE streak — need 5+ same direction in a row
+          int highStreak=0, lowStreak=0;
+          for(int i=recent.length-1;i>=0;i--){
+            if(recent[i]>4) { if(lowStreak>0) break; highStreak++; }
+            else { if(highStreak>0) break; lowStreak++; }
+          }
+          // Only enter if streak is 5+ consecutive ticks
+          if(highStreak >= 5) return {'type':'DIGITUNDER','barrier':5,'label':'Under 5 ($highStreak streak)'};
+          if(lowStreak >= 5)  return {'type':'DIGITOVER','barrier':4,'label':'Over 4 ($lowStreak streak)'};
+          // Also check strong bias in recent 10 (>70%)
           final recentOver = recent.where((d)=>d>4).length;
           final overPct = recentOver/recent.length;
-          // Only trade if bias is >60%
-          if(overPct >= 0.60) return {'type':'DIGITUNDER','barrier':5,'label':'Under 5 (high streak)'};
-          if(overPct <= 0.40) return {'type':'DIGITOVER','barrier':4,'label':'Over 4 (low streak)'};
-          // No clear bias — use full history
-          final fullOver = _hist.where((d)=>d>4).length;
-          return fullOver/_hist.length>0.5
-            ?{'type':'DIGITUNDER','barrier':5,'label':'Under 5'}
-            :{'type':'DIGITOVER','barrier':4,'label':'Over 4'};
+          if(overPct >= 0.70) return {'type':'DIGITUNDER','barrier':5,'label':'Under 5 (${(overPct*100).round()}% high)'};
+          if(overPct <= 0.30) return {'type':'DIGITOVER','barrier':4,'label':'Over 4 (${((1-overPct)*100).round()}% low)'};
+          // No strong signal — skip this trade cycle
+          return {'type':'SKIP','barrier':null,'label':'Waiting for streak...'};
 
         case 'matches':
           // Find coldest digit in recent 20 ticks — match it (overdue)
@@ -1280,18 +1676,17 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
         await Future.delayed(const Duration(seconds:1));
       }
 
-      // ── SCHEDULE CHECK ──
-      if (!_botScheduleAllowed(bot)) {
-        final start = _botStartHour[bot]??8;
-        setState((){_botMsg[bot]='⏰ Outside schedule — waiting for ${start.toString().padLeft(2,'0')}:00';_botMsgC[bot]=Colors.grey;});
-        // Sleep until schedule window opens
-        while(!_botScheduleAllowed(bot) && (_botOn[bot]??false)) {
-          await Future.delayed(const Duration(minutes:1));
-        }
-        if(!(_botOn[bot]??false)) return;
-        setState((){_botMsg[bot]='✅ Schedule active — starting...';_botMsgC[bot]=const Color(0xFF1DE9B6);});
+      // ── RECOVERY MODE CHECK ──
+      if (_recoveryModeOn && (_botRecovery[bot]??false)) {
+        setState((){_botMsg[bot]='🔄 Recovery mode — cooling down...';_botMsgC[bot]=Colors.orange;});
+        // Skip 2 trade cycles then resume
+        await Future.delayed(const Duration(seconds:6));
+        setState((){_botRecovery[bot]=false; _botConsecLoss[bot]=0;
+          _botMsg[bot]='✅ Recovery done — resuming';_botMsgC[bot]=const Color(0xFF1DE9B6);});
         await Future.delayed(const Duration(seconds:1));
       }
+
+
 
       // ── SIGNAL LINK — wait for matching signal AND confidence >= 60 ──
       if(_botSigLink[bot]!) {
@@ -1316,6 +1711,39 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
       setState((){_botBusy[bot]=true; _botMsg[bot]='📤 Trade #${count+1} — \$${curStake.toStringAsFixed(2)}...'; _botMsgC[bot]=const Color(0xFFFFD700);});
 
       final decision=_botDecision(bot);
+      // Skip if no good entry point
+      if(decision['type']=='SKIP'){
+        setState((){_botMsg[bot]=decision['label']?.toString()??'Waiting...';_botMsgC[bot]=Colors.grey;});
+        await Future.delayed(const Duration(seconds:3));
+        continue;
+      }
+      // ── RISK CHECKS ──
+      // 1. Volatility spike — skip
+      if(_isVolatilitySpike()){
+        setState((){_botMsg[bot]='⚠️ Volatility spike — skipping...';_botMsgC[bot]=Colors.orange;});
+        await Future.delayed(const Duration(seconds:5));
+        continue;
+      }
+      // 2. Trade frequency — max trades per minute
+      if(!_canTradeNow(bot)){
+        setState((){_botMsg[bot]='⏱ Max trades/min reached — waiting...';_botMsgC[bot]=Colors.orange;});
+        await Future.delayed(const Duration(seconds:10));
+        continue;
+      }
+      // 3. Confidence check — only trade if strong signal
+      final conf = _signalConfidence(bot);
+      if(conf < _minConfidence){
+        setState((){_botMsg[bot]='🔍 Confidence ${conf.toStringAsFixed(0)}% < ${_minConfidence.toStringAsFixed(0)}% — waiting...';_botMsgC[bot]=Colors.grey;});
+        await Future.delayed(const Duration(seconds:4));
+        continue;
+      }
+      // 4. Loss streak — pause after X losses
+      if(_recoveryModeOn && (_botConsecLoss[bot]??0) >= _pauseAfterLosses){
+        setState((){_botMsg[bot]='🛑 ${_pauseAfterLosses} consecutive losses — pausing...';_botMsgC[bot]=_red;});
+        await Future.delayed(const Duration(seconds:30));
+        setState((){_botConsecLoss[bot]=0;_botMsg[bot]='✅ Resumed after pause';_botMsgC[bot]=_accent;});
+        continue;
+      }
       try {
         final botSym = _botSym[bot] ?? _sym; // each bot uses its own market
         final prop=await deriv.getProposal(symbol:botSym,contractType:decision['type'],amount:curStake,barrier:decision['barrier']);
@@ -1332,21 +1760,12 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
 
         if(cid.isNotEmpty){
           final comp=Completer<Map>();
-          final prev=deriv.onContract;
-          // Filter by contract ID so multiple bots don't cross-fire
-          deriv.onContract=(data){
-            prev?.call(data);
-            final dataCid = data['contract_id']?.toString() ?? '';
-            if (dataCid.isNotEmpty && dataCid != cid) return; // not our contract
-            final status=data['status']?.toString()??'';
-            final isSold=data['is_sold'];
-            final settled=isSold==1||isSold==true||status=='won'||status=='lost';
-            if(settled&&!comp.isCompleted) comp.complete(Map.from(data));
-          };
+          // Register completer for this specific contract — no onContract override needed
+          deriv.registerContractCompleter(cid, comp);
           deriv.subscribeContract(cid);
           final result=await comp.future.timeout(const Duration(seconds:20),onTimeout:()=>{});
+          deriv.unregisterContractCompleter(cid);
           if(!mounted||!(_botOn[bot]??false)) return;
-          deriv.onContract=prev;
           final profit=(result['profit'] as num?)?.toDouble()??0;
           final status2=result['status']?.toString()??'';
           final won=status2=='won'||profit>0;
@@ -1355,6 +1774,8 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
             _botCount[bot]=(_botCount[bot]??0)+1;
             if(won) _botWins[bot]=(_botWins[bot]??0)+1;
             _botPnl[bot]=(_botPnl[bot]??0)+profit;
+            // Update recovery mode tracking
+            _updateRecovery(bot, won);
 
             // ── MARTINGALE LOGIC ──
             if(_botMartOn[bot]!) {
@@ -1373,7 +1794,10 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
             final martInfo=_botMartOn[bot]!&&!won?' → next \$${_botCurStake[bot]!.toStringAsFixed(2)}':'';
             _botMsg[bot]=won?'✅ WIN +\$${profit.toStringAsFixed(2)}  (#${_botCount[bot]})':'❌ LOSS -\$${profit.abs().toStringAsFixed(2)}  (#${_botCount[bot]})$martInfo';
             _botMsgC[bot]=won?const Color(0xFF00C853):const Color(0xFFFF4444);
-            _logTrade(market:_botSymName[bot]??_symName, type:decision['label']?.toString()??'', stake:curStake, won:won, profit:profit);
+            final botEntry = result['entry_spot']?.toString() ?? result['entry_tick_display_value']?.toString() ?? '';
+            final botExit  = result['exit_tick_display_value']?.toString() ?? result['sell_spot']?.toString() ?? '';
+            _logTrade(market:_botSymName[bot]??_symName, type:decision['label']?.toString()??'', stake:curStake, won:won, profit:profit, entrySpot:botEntry, exitSpot:botExit);
+            _recordTrade(bot); // track frequency
             _playSound(won);
             // Telegram alert
             if(won && _tgWinAlert) {
@@ -1493,10 +1917,10 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
     backgroundColor: const Color(0xFF060B18),
     body: SafeArea(child: Column(children:[
       _header(),
+      _nav(),  // Nav at top for more screen space
       Expanded(child: IndexedStack(index:_tab, children:[
-        _dashboard(), _analyzer(), _calculator(), _bots(), _guide(), _profile(),
+        _dashboard(), _analyzer(), _calculator(), _bots(), _profile(),
       ])),
-      _nav(),
     ])),
   );
 
@@ -1505,12 +1929,12 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
     Color ac = widget.isDemo ? const Color(0xFF00C853) : const Color(0xFFFFD700);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal:16,vertical:12),
-      decoration: const BoxDecoration(color:Color(0xFF0D1421),border:Border(bottom:BorderSide(color:Color(0xFF1A2640)))),
+      decoration: BoxDecoration(color:_card,border:Border(bottom:BorderSide(color:_cardBorder))),
       child: Row(mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[
         Row(children:[
           Container(width:32,height:32,decoration:const BoxDecoration(shape:BoxShape.circle,gradient:LinearGradient(colors:[Color(0xFF00C853),Color(0xFF1DE9B6)])),child:const Center(child:Text('🦬',style:TextStyle(fontSize:18)))),
           const SizedBox(width:8),
-          const Text('SOET',style:TextStyle(color:Colors.white,fontSize:20,fontWeight:FontWeight.w900,letterSpacing:4)),
+          Text('SOET',style:TextStyle(color:_accent,fontSize:18,fontWeight:FontWeight.w900,letterSpacing:4)),
         ]),
         Row(children:[
           Column(crossAxisAlignment:CrossAxisAlignment.end,children:[
@@ -1533,6 +1957,17 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
             ? SizedBox(width:10,height:10,child:CircularProgressIndicator(strokeWidth:2,color:Colors.orange))
             : ScaleTransition(scale:_pulseAnim,child:Container(width:8,height:8,decoration:BoxDecoration(color:_live?const Color(0xFF00C853):Colors.orange,shape:BoxShape.circle))),
           const SizedBox(width:8),
+          // Sound toggle
+          GestureDetector(
+            onTap:()=>setState(()=>_soundOn=!_soundOn),
+            child:Icon(_soundOn?Icons.volume_up_rounded:Icons.volume_off_rounded,
+              color:_soundOn?_accent:Colors.grey,size:20)),
+          const SizedBox(width:12),
+          // Theme toggle
+          GestureDetector(
+            onTap: () => SOETApp.of(context)?.toggleTheme(),
+            child: Icon(_isDark ? Icons.light_mode : Icons.dark_mode, color:Colors.grey, size:20)),
+          const SizedBox(width:12),
           GestureDetector(onTap:_logout,child:const Icon(Icons.logout,color:Colors.grey,size:20)),
         ]),
       ]),
@@ -1589,7 +2024,7 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
       ),
       const SizedBox(height:12),
     ],
-    if(_streak>0)...[_streakCard(),const SizedBox(height:16)],
+    if(_streak>0) ...[_streakCard(),const SizedBox(height:16)],
     _digitDist(),
     const SizedBox(height:16),
     _signalCard(),
@@ -1643,15 +2078,15 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
     int total=_hist.length, mx=total>0&&_freq.values.isNotEmpty?_freq.values.reduce(max):1;
     return Container(padding:const EdgeInsets.all(16),decoration:BoxDecoration(color:const Color(0xFF0D1421),borderRadius:BorderRadius.circular(16),border:Border.all(color:const Color(0xFF1A2640))),
       child:Column(children:[
-        const Text('Digit Distribution',style:TextStyle(color:Colors.white,fontSize:18,fontWeight:FontWeight.bold)),
+        const Text('DIGIT DISTRIBUTION',style:TextStyle(color:Color(0xFF1DE9B6),fontSize:12,fontWeight:FontWeight.bold,letterSpacing:1.5)),
         const SizedBox(height:16),
         total==0
           ? const Padding(padding:EdgeInsets.all(20),child:Text('Waiting for live ticks...',style:TextStyle(color:Colors.grey)))
           : LayoutBuilder(builder:(ctx,constraints){
               // Fit all 10 digits perfectly regardless of screen width
-              final ringSize = ((constraints.maxWidth - 20) / 10).clamp(28.0, 48.0);
-              final fontSize = (ringSize * 0.33).clamp(9.0, 15.0);
-              final pctSize  = (ringSize * 0.22).clamp(7.0, 10.0);
+              final ringSize = ((constraints.maxWidth - 16) / 10).clamp(28.0, 50.0);
+              final fontSize = (ringSize * 0.36).clamp(10.0, 18.0);
+              final pctSize  = (ringSize * 0.24).clamp(8.0, 11.0);
               return Row(mainAxisAlignment:MainAxisAlignment.spaceEvenly,children:List.generate(10,(digit){
                 int freq=_freq[digit]??0; double pct=freq/total*100;
                 bool isLast=digit==_lastDigit;
@@ -1672,8 +2107,8 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
                 }
                 return Column(children:[
                   SizedBox(width:ringSize,height:ringSize,child:Stack(alignment:Alignment.center,children:[
-                    CircularProgressIndicator(value:pct/100,strokeWidth:2.5,backgroundColor:const Color(0xFF1A2640),valueColor:AlwaysStoppedAnimation<Color>(ring)),
-                    Text('$digit',style:TextStyle(color:isLast?const Color(0xFF1DE9B6):Colors.white70,fontWeight:isLast?FontWeight.bold:FontWeight.normal,fontSize:fontSize)),
+                    CircularProgressIndicator(value:pct/100,strokeWidth:4.0,backgroundColor:const Color(0xFF1A2640),valueColor:AlwaysStoppedAnimation<Color>(ring)),
+                    Text('$digit',style:TextStyle(color:isLast?const Color(0xFF1DE9B6):Colors.white,fontWeight:FontWeight.w800,fontSize:fontSize)),
                   ])),
                   const SizedBox(height:4),
                   Text('${pct.toStringAsFixed(1)}%',style:TextStyle(color:ring==const Color(0xFFFF1744)||ring==const Color(0xFFFF6B35)?const Color(0xFFFF4444):ring==const Color(0xFF00E676)||ring==const Color(0xFF1DE9B6)?const Color(0xFF00C853):Colors.grey,fontSize:pctSize,fontWeight:FontWeight.normal)),
@@ -1740,7 +2175,7 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
           Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
             const Text('SOET SIGNAL v2',style:TextStyle(color:Colors.grey,fontSize:10,letterSpacing:2)),
             const SizedBox(height:4),
-            Text(_signal,style:TextStyle(color:_sigColor,fontSize:14,fontWeight:FontWeight.bold)),
+            Text(_signal,style:TextStyle(color:_sigColor,fontSize:13,fontWeight:FontWeight.w800,letterSpacing:0.3)),
             if(_sigType.isNotEmpty) Text('Type: $_sigType',style:const TextStyle(color:Colors.grey,fontSize:11)),
           ])),
           Container(padding:const EdgeInsets.symmetric(horizontal:10,vertical:4),decoration:BoxDecoration(color:_sigColor.withOpacity(0.15),borderRadius:BorderRadius.circular(12)),
@@ -1787,147 +2222,168 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
 
   Widget _tradePanel() {
     final types = [
-      {'l':'DIFFERS','i':Icons.remove_circle_outline,'c':const Color(0xFF1DE9B6)},
-      {'l':'EVEN',   'i':Icons.looks_two_outlined,   'c':const Color(0xFF00C853)},
-      {'l':'ODD',    'i':Icons.looks_3_outlined,     'c':const Color(0xFF00C853)},
-      {'l':'OVER',   'i':Icons.trending_up,          'c':const Color(0xFFFFD700)},
-      {'l':'UNDER',  'i':Icons.trending_down,        'c':const Color(0xFFFF9800)},
-      {'l':'MATCHES','i':Icons.center_focus_strong,  'c':const Color(0xFFFF4444)},
+      {'l':'DIFFERS','c':const Color(0xFF1DE9B6)},
+      {'l':'EVEN',   'c':const Color(0xFF00C853)},
+      {'l':'ODD',    'c':const Color(0xFF00C853)},
+      {'l':'OVER',   'c':const Color(0xFFFFD700)},
+      {'l':'UNDER',  'c':const Color(0xFFFF9800)},
+      {'l':'MATCHES','c':const Color(0xFFFF4444)},
     ];
-    Color pc = const Color(0xFF1DE9B6);
+    String sugg = _signal.contains('DIFFERS')||_signal.contains('Differ')?'DIFFERS':
+                  _signal.contains('EVEN')||_signal.contains('Even')?'EVEN':
+                  _signal.contains('ODD')||_signal.contains('Odd')?'ODD':
+                  _signal.contains('OVER')||_signal.contains('Over')?'OVER':
+                  _signal.contains('UNDER')||_signal.contains('Under')?'UNDER':'';
+    Color pc=const Color(0xFF1DE9B6);
     for(final t in types){ if(t['l']==_tType){ pc=t['c'] as Color; break; }}
-    String sugg = _sigType=='Over/Under'?(_signal.contains('OVER')?'OVER':'UNDER'):_sigType=='Even/Odd'?(_signal.contains('EVEN')?'EVEN':'ODD'):_sigType=='Differs'?'DIFFERS':'';
 
     return Container(
-      decoration:BoxDecoration(color:const Color(0xFF0D1421),borderRadius:BorderRadius.circular(20),border:Border.all(color:pc.withOpacity(0.4),width:1.5),boxShadow:[BoxShadow(color:pc.withOpacity(0.08),blurRadius:20,spreadRadius:2)]),
-      child:Column(children:[
-          // Signal accuracy tracker
-          if (_sigWins + _sigLosses > 0) ...[
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal:12, vertical:8),
-              margin: const EdgeInsets.only(bottom:10),
-              decoration: BoxDecoration(
-                color: const Color(0xFF1A2640),
-                borderRadius: BorderRadius.circular(10)),
-              child: Row(children:[
-                const Icon(Icons.track_changes, color:Color(0xFF1DE9B6), size:14),
-                const SizedBox(width:8),
-                Expanded(child: Text(_sigAccuracy, style: const TextStyle(color:Color(0xFF1DE9B6), fontSize:11, fontWeight:FontWeight.bold))),
-                GestureDetector(
-                  onTap: ()=>setState((){_sigWins=0;_sigLosses=0;}),
-                  child: const Icon(Icons.refresh, color:Colors.grey, size:14)),
-              ]),
-            ),
-          ],
-        // Header
-        Container(padding:const EdgeInsets.symmetric(horizontal:16,vertical:12),
-          decoration:BoxDecoration(gradient:LinearGradient(colors:[pc.withOpacity(0.15),pc.withOpacity(0.05)]),borderRadius:const BorderRadius.vertical(top:Radius.circular(20))),
-          child:Row(mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[
-            Row(children:[Icon(Icons.flash_on,color:pc,size:18),const SizedBox(width:8),const Text('QUICK TRADE',style:TextStyle(color:Colors.white,fontWeight:FontWeight.bold,fontSize:14,letterSpacing:2))]),
-            if(sugg.isNotEmpty) Container(padding:const EdgeInsets.symmetric(horizontal:10,vertical:4),decoration:BoxDecoration(color:pc.withOpacity(0.15),borderRadius:BorderRadius.circular(10),border:Border.all(color:pc.withOpacity(0.4))),
-              child:Row(mainAxisSize:MainAxisSize.min,children:[Icon(Icons.auto_awesome,color:pc,size:10),const SizedBox(width:4),Text('AI: $sugg',style:TextStyle(color:pc,fontSize:10,fontWeight:FontWeight.bold))])),
-          ])),
-        Padding(padding:const EdgeInsets.all(16),child:Column(children:[
-          // Trade type grid
-          GridView.count(shrinkWrap:true,physics:const NeverScrollableScrollPhysics(),crossAxisCount:3,crossAxisSpacing:8,mainAxisSpacing:8,childAspectRatio:2.2,
-            children:types.map((t){
-              bool sel=_tType==t['l']; Color c=t['c'] as Color; bool sug=t['l']==sugg;
-              return GestureDetector(onTap:()=>setState(()=>_tType=t['l'] as String),
-                child:AnimatedContainer(duration:const Duration(milliseconds:200),
-                  decoration:BoxDecoration(color:sel?c:c.withOpacity(0.07),borderRadius:BorderRadius.circular(12),border:Border.all(color:sel?c:sug?c.withOpacity(0.6):c.withOpacity(0.2),width:sel?2:sug?1.5:1),boxShadow:sel?[BoxShadow(color:c.withOpacity(0.3),blurRadius:10,spreadRadius:1)]:null),
-                  child:Column(mainAxisAlignment:MainAxisAlignment.center,children:[
-                    Icon(t['i'] as IconData,color:sel?Colors.black:c,size:16),
-                    const SizedBox(height:2),
-                    Text(t['l'] as String,style:TextStyle(color:sel?Colors.black:c,fontSize:10,fontWeight:FontWeight.bold)),
-                    if(sug&&!sel) Text('✦ AI',style:TextStyle(color:c.withOpacity(0.8),fontSize:8)),
-                  ])));
-            }).toList()),
-          const SizedBox(height:12),
-          // Barrier selector for OVER/UNDER
-          if(_tType=='OVER'||_tType=='UNDER') ...[
-            Row(children:[Text('Barrier:',style:TextStyle(color:pc,fontSize:12,fontWeight:FontWeight.bold)),const SizedBox(width:8),
-              ...['1','2','3','4','5','6','7','8'].map((b){bool sel=_tBarrier==b;return GestureDetector(onTap:()=>setState(()=>_tBarrier=b),child:Container(width:32,height:32,margin:const EdgeInsets.only(right:6),decoration:BoxDecoration(color:sel?pc:const Color(0xFF1A2640),borderRadius:BorderRadius.circular(8)),child:Center(child:Text(b,style:TextStyle(color:sel?Colors.black:Colors.grey,fontWeight:FontWeight.bold,fontSize:12)))));}  ).toList(),
-            ]),const SizedBox(height:12),
-          ],
-          // Digit selector for MATCHES/DIFFERS
-          if(_tType=='MATCHES'||_tType=='DIFFERS') ...[
-            Row(children:[Text(_tType=='MATCHES'?'Digit:':'Avoid:',style:TextStyle(color:pc,fontSize:12,fontWeight:FontWeight.bold)),const SizedBox(width:8),
-              ...List.generate(10,(i){
-                bool sel=_tDigit==i; bool hot=_hist.length>20&&_freq.values.isNotEmpty&&(_freq[i]??0)==_freq.values.reduce(max);
-                return GestureDetector(onTap:()=>setState(()=>_tDigit=i),child:Stack(children:[
-                  Container(width:28,height:28,margin:const EdgeInsets.only(right:4),decoration:BoxDecoration(color:sel?pc:const Color(0xFF1A2640),borderRadius:BorderRadius.circular(7),border:Border.all(color:hot&&!sel?const Color(0xFFFF4444):Colors.transparent)),child:Center(child:Text('$i',style:TextStyle(color:sel?Colors.black:hot?const Color(0xFFFF4444):Colors.grey,fontWeight:FontWeight.bold,fontSize:11)))),
-                  if(hot) Positioned(top:0,right:3,child:Container(width:5,height:5,decoration:const BoxDecoration(color:Color(0xFFFF4444),shape:BoxShape.circle))),
-                ]));
-              }),
-            ]),const SizedBox(height:12),
-          ],
-          // Stake
-          Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
-            const Text('Stake:',style:TextStyle(color:Colors.grey,fontSize:12)),
-            const SizedBox(height:6),
-            Row(children:[
-              ...[0.35,0.5,1.0,2.0,5.0].map((amt){bool sel=_tStake==amt;return GestureDetector(onTap:()=>setState(()=>_tStake=amt),child:Container(padding:const EdgeInsets.symmetric(horizontal:10,vertical:6),margin:const EdgeInsets.only(right:6),decoration:BoxDecoration(color:sel?const Color(0xFF00C853):const Color(0xFF1A2640),borderRadius:BorderRadius.circular(8)),child:Text('\$$amt',style:TextStyle(color:sel?Colors.black:Colors.grey,fontWeight:sel?FontWeight.bold:FontWeight.normal,fontSize:11))));}).toList(),
-            ]),
-            const SizedBox(height:8),
-            SizedBox(height:38,child:TextField(
-              keyboardType:const TextInputType.numberWithOptions(decimal:true),
-              style:const TextStyle(color:Colors.white,fontSize:13),
-              decoration:InputDecoration(
-                hintText:'Custom amount...',hintStyle:const TextStyle(color:Colors.grey,fontSize:12),
-                prefixText:'\$ ',prefixStyle:const TextStyle(color:Color(0xFF00C853),fontSize:13),
-                contentPadding:const EdgeInsets.symmetric(horizontal:10,vertical:8),
-                filled:true,fillColor:const Color(0xFF1A2640),
-                border:OutlineInputBorder(borderRadius:BorderRadius.circular(8),borderSide:BorderSide.none),
-                focusedBorder:OutlineInputBorder(borderRadius:BorderRadius.circular(8),borderSide:const BorderSide(color:Color(0xFF00C853),width:1.5)),
-              ),
-              onChanged:(v){double? val=double.tryParse(v);if(val!=null&&val>0) setState(()=>_tStake=val);},
-            )),
-          // Stake risk warning
-          if (_stakeRiskLabel.isNotEmpty) ...[
-            const SizedBox(height:6),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal:10, vertical:7),
-              decoration: BoxDecoration(
-                color: _stakeRiskColor.withOpacity(0.1),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: _stakeRiskColor.withOpacity(0.4))),
-              child: Row(children:[
-                Icon(Icons.warning_amber_rounded, color: _stakeRiskColor, size:13),
-                const SizedBox(width:6),
-                Expanded(child: Text(_stakeRiskLabel, style: TextStyle(color: _stakeRiskColor, fontSize:11, fontWeight:FontWeight.bold))),
-              ]),
-            ),
-          ],
+      padding:const EdgeInsets.all(12),
+      decoration:BoxDecoration(color:_card,borderRadius:BorderRadius.circular(16),border:Border.all(color:_cardBorder)),
+      child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+        // Row 1: Trade type chips
+        SingleChildScrollView(scrollDirection:Axis.horizontal,child:Row(children:
+          types.map((t){
+            bool sel=_tType==t['l']; bool sug=t['l']==sugg;
+            Color c=t['c'] as Color;
+            return GestureDetector(
+              onTap:()=>setState(()=>_tType=t['l'] as String),
+              child:AnimatedContainer(duration:const Duration(milliseconds:150),
+                margin:const EdgeInsets.only(right:6),
+                padding:const EdgeInsets.symmetric(horizontal:10,vertical:6),
+                decoration:BoxDecoration(
+                  color:sel?c:sug?c.withOpacity(0.12):_isDark?const Color(0xFF1A2640):const Color(0xFFEEF2F7),
+                  borderRadius:BorderRadius.circular(20),
+                  border:Border.all(color:sel?c:sug?c.withOpacity(0.5):Colors.transparent,width:sel?2:1)),
+                child:Row(mainAxisSize:MainAxisSize.min,children:[
+                  if(sug&&!sel) Icon(Icons.bolt,color:c,size:10),
+                  Text(t['l'] as String,style:TextStyle(color:sel?Colors.black:sug?c:_textSec,fontWeight:sel||sug?FontWeight.bold:FontWeight.normal,fontSize:11)),
+                ])));
+          }).toList()
+        )),
+        const SizedBox(height:10),
+
+        // Row 2: Digit selector (for DIFFERS/MATCHES) or Barrier (for OVER/UNDER)
+        if(_tType=='OVER'||_tType=='UNDER') ...[
+          Row(children:[
+            Text('Barrier:',style:TextStyle(color:_textSec,fontSize:11)),
+            const SizedBox(width:8),
+            ...List.generate(9,(i){
+              final b=(i+1).toString();
+              final sel=_tBarrier==b;
+              return GestureDetector(
+                onTap:()=>setState(()=>_tBarrier=b),
+                child:Container(margin:const EdgeInsets.only(right:5),
+                  width:28,height:28,
+                  decoration:BoxDecoration(
+                    color:sel?pc:_isDark?const Color(0xFF1A2640):const Color(0xFFEEF2F7),
+                    borderRadius:BorderRadius.circular(6)),
+                  child:Center(child:Text(b,style:TextStyle(color:sel?Colors.black:_textSec,fontWeight:sel?FontWeight.bold:FontWeight.normal,fontSize:11)))));
+            }),
           ]),
-          const SizedBox(height:12),
-          // Payout bar
-          Container(padding:const EdgeInsets.symmetric(horizontal:14,vertical:10),decoration:BoxDecoration(color:const Color(0xFF1A2640),borderRadius:BorderRadius.circular(12)),
-            child:Row(mainAxisAlignment:MainAxisAlignment.spaceAround,children:[
-              Column(children:[const Text('Stake',style:TextStyle(color:Colors.grey,fontSize:10)),Text('$_currency ${_tStake.toStringAsFixed(2)}',style:const TextStyle(color:Colors.white,fontWeight:FontWeight.bold,fontSize:14))]),
-              Container(width:1,height:30,color:const Color(0xFF2A3A50)),
-              Column(children:[const Text('Profit',style:TextStyle(color:Colors.grey,fontSize:10)),Text('+$_currency ${_estPayout.toStringAsFixed(2)}',style:const TextStyle(color:Color(0xFF00C853),fontWeight:FontWeight.bold,fontSize:14))]),
-              Container(width:1,height:30,color:const Color(0xFF2A3A50)),
-              Column(children:[const Text('Return',style:TextStyle(color:Colors.grey,fontSize:10)),Text('$_currency ${(_tStake+_estPayout).toStringAsFixed(2)}',style:TextStyle(color:pc,fontWeight:FontWeight.bold,fontSize:14))]),
-            ])),
-          const SizedBox(height:12),
-          // TRADE BUTTON
-          GestureDetector(onTap:(_tBusy||!_live)?null:_placeTrade,
-            child:AnimatedContainer(duration:const Duration(milliseconds:200),width:double.infinity,padding:const EdgeInsets.symmetric(vertical:16),
+          const SizedBox(height:10),
+        ],
+        if(_tType=='DIFFERS'||_tType=='MATCHES') ...[
+          Row(children:[
+            Text(_tType=='MATCHES'?'Digit:':'Avoid:',style:TextStyle(color:pc,fontSize:11,fontWeight:FontWeight.bold)),
+            const SizedBox(width:8),
+            ...List.generate(10,(i){
+              final sel=_tDigit==i;
+              final isAvoid=_avoidDigits.contains(i);
+              final isSafe=_safeDigits.contains(i);
+              return GestureDetector(
+                onTap:()=>setState(()=>_tDigit=i),
+                child:Container(margin:const EdgeInsets.only(right:4),
+                  width:26,height:26,
+                  decoration:BoxDecoration(
+                    color:sel?pc:isAvoid?_red.withOpacity(0.15):isSafe?_green.withOpacity(0.15):_isDark?const Color(0xFF1A2640):const Color(0xFFEEF2F7),
+                    borderRadius:BorderRadius.circular(6),
+                    border:Border.all(color:sel?pc:isAvoid?_red.withOpacity(0.4):isSafe?_green.withOpacity(0.4):Colors.transparent)),
+                  child:Center(child:Text('$i',style:TextStyle(color:sel?Colors.black:isAvoid?_red:isSafe?_green:_textSec,fontWeight:sel?FontWeight.bold:FontWeight.normal,fontSize:10)))));
+            }),
+          ]),
+          const SizedBox(height:10),
+        ],
+
+        // Row 3: Stake + Duration + Trade button in one row
+        Row(children:[
+          // Stake quick buttons
+          ...([0.35,1.0,2.0,5.0]).map((amt){
+            bool sel=_tStake==amt;
+            return GestureDetector(
+              onTap:()=>setState(()=>_tStake=amt),
+              child:Container(margin:const EdgeInsets.only(right:5),
+                padding:const EdgeInsets.symmetric(horizontal:8,vertical:6),
+                decoration:BoxDecoration(
+                  color:sel?_green:_isDark?const Color(0xFF1A2640):const Color(0xFFEEF2F7),
+                  borderRadius:BorderRadius.circular(8)),
+                child:Text('\$$amt',style:TextStyle(color:sel?Colors.black:_textSec,fontSize:10,fontWeight:sel?FontWeight.bold:FontWeight.normal))));
+          }).toList(),
+          const SizedBox(width:4),
+          // Custom stake
+          Expanded(child:SizedBox(height:32,child:TextField(
+            keyboardType:const TextInputType.numberWithOptions(decimal:true),
+            style:TextStyle(color:_textPrim,fontSize:11),
+            decoration:InputDecoration(
+              hintText:'Custom',hintStyle:TextStyle(color:_textSec,fontSize:10),
+              prefixText:'\$ ',prefixStyle:TextStyle(color:_green,fontSize:10),
+              filled:true,fillColor:_isDark?const Color(0xFF1A2640):const Color(0xFFEEF2F7),
+              border:OutlineInputBorder(borderRadius:BorderRadius.circular(8),borderSide:BorderSide.none),
+              contentPadding:const EdgeInsets.symmetric(horizontal:8,vertical:0)),
+            onChanged:(v){double? val=double.tryParse(v);if(val!=null&&val>0)setState(()=>_tStake=val);},
+          ))),
+          const SizedBox(width:6),
+          // Duration
+          Container(height:32,padding:const EdgeInsets.symmetric(horizontal:8),
+            decoration:BoxDecoration(color:_isDark?const Color(0xFF1A2640):const Color(0xFFEEF2F7),borderRadius:BorderRadius.circular(8)),
+            child:DropdownButtonHideUnderline(child:DropdownButton<int>(
+              value:_tDuration,
+              dropdownColor:_card,
+              style:TextStyle(color:_textPrim,fontSize:10),
+              items:List.generate(10,(i)=>DropdownMenuItem(value:i+1,child:Text('${i+1}t'))),
+              onChanged:(v){if(v!=null)setState(()=>_tDuration=v);},
+            ))),
+        ]),
+
+        // Stake risk warning
+        if(_stakeRiskLabel.isNotEmpty) ...[
+          const SizedBox(height:6),
+          Container(padding:const EdgeInsets.symmetric(horizontal:10,vertical:5),
+            decoration:BoxDecoration(color:_stakeRiskColor.withOpacity(0.08),borderRadius:BorderRadius.circular(6),border:Border.all(color:_stakeRiskColor.withOpacity(0.3))),
+            child:Row(children:[Icon(Icons.warning_amber_rounded,color:_stakeRiskColor,size:11),const SizedBox(width:5),Text(_stakeRiskLabel,style:TextStyle(color:_stakeRiskColor,fontSize:10,fontWeight:FontWeight.bold))])),
+        ],
+        const SizedBox(height:10),
+
+        // Row 4: Payout info + Trade button
+        Row(children:[
+          Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+            Text('Stake: \$${_tStake.toStringAsFixed(2)}',style:TextStyle(color:_textSec,fontSize:10)),
+            Text('Profit: +\$${_estPayout.toStringAsFixed(2)}',style:TextStyle(color:_green,fontSize:10,fontWeight:FontWeight.bold)),
+          ])),
+          // Trade button
+          GestureDetector(
+            onTap:(_live&&!_tBusy)?_placeTrade:null,
+            child:AnimatedContainer(duration:const Duration(milliseconds:150),
+              padding:const EdgeInsets.symmetric(horizontal:28,vertical:12),
               decoration:BoxDecoration(
-                gradient:!_live?const LinearGradient(colors:[Color(0xFF2A3A50),Color(0xFF1A2640)]):_tBusy?LinearGradient(colors:[pc.withOpacity(0.4),pc.withOpacity(0.2)]):LinearGradient(colors:[pc,pc.withOpacity(0.75)]),
-                borderRadius:BorderRadius.circular(14),
-                boxShadow:(_live&&!_tBusy)?[BoxShadow(color:pc.withOpacity(0.35),blurRadius:16,spreadRadius:1)]:null),
-              child:Center(child:Row(mainAxisSize:MainAxisSize.min,children:_tBusy
-                ?[SizedBox(width:14,height:14,child:CircularProgressIndicator(strokeWidth:2,color:pc)),const SizedBox(width:10),Text(_tType,style:TextStyle(color:pc,fontWeight:FontWeight.bold,fontSize:15))]
-                :[Icon(_live?Icons.play_arrow_rounded:Icons.hourglass_empty,color:_live?Colors.black:Colors.grey,size:22),const SizedBox(width:8),Text(!_live?'Waiting for market...':'$_tType  •  $_currency ${_tStake.toStringAsFixed(2)}',style:TextStyle(color:_live?Colors.black:Colors.grey,fontWeight:FontWeight.bold,fontSize:15,letterSpacing:1))])))),
-          // Result — only win or loss shown
-          if(_tMsg.isNotEmpty)...[const SizedBox(height:10),AnimatedContainer(duration:const Duration(milliseconds:250),width:double.infinity,padding:const EdgeInsets.symmetric(vertical:14,horizontal:16),
-            decoration:BoxDecoration(color:_tColor.withOpacity(0.12),borderRadius:BorderRadius.circular(12),border:Border.all(color:_tColor.withOpacity(0.6),width:1.5)),
-            child:Text(_tMsg,textAlign:TextAlign.center,style:TextStyle(color:_tColor,fontSize:16,fontWeight:FontWeight.bold)))],
-        ])),
+                gradient:LinearGradient(colors:_live&&!_tBusy?[pc,pc.withOpacity(0.7)]:[Colors.grey.withOpacity(0.3),Colors.grey.withOpacity(0.2)]),
+                borderRadius:BorderRadius.circular(12),
+                boxShadow:_live&&!_tBusy?[BoxShadow(color:pc.withOpacity(0.35),blurRadius:12)]:null),
+              child:_tBusy
+                ?SizedBox(width:20,height:20,child:CircularProgressIndicator(strokeWidth:2,color:Colors.black))
+                :Text(_tType,style:const TextStyle(color:Colors.black,fontWeight:FontWeight.w900,fontSize:13,letterSpacing:0.5)))),
+        ]),
+
+        // Trade result
+        if(_tMsg.isNotEmpty) Container(
+          margin:const EdgeInsets.only(top:8),
+          padding:const EdgeInsets.symmetric(horizontal:12,vertical:8),
+          decoration:BoxDecoration(color:_tColor.withOpacity(0.1),borderRadius:BorderRadius.circular(8),border:Border.all(color:_tColor.withOpacity(0.4))),
+          child:Center(child:Text(_tMsg,style:TextStyle(color:_tColor,fontWeight:FontWeight.bold,fontSize:13)))),
       ]),
     );
   }
+
 
   Widget _recentDigits() {
     List<int> last20=_hist.length>20?_hist.sublist(_hist.length-20):List.from(_hist);
@@ -1964,50 +2420,195 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
 
   // ── ANALYZER ────────────────────────────────
   Widget _analyzer() {
-    int total=_hist.length, even=_hist.where((d)=>d%2==0).length, over=_hist.where((d)=>d>4).length;
-    double ep=total>0?even/total*100:50, op=total>0?over/total*100:50;
-    int mx=0, mn=0, hot=0, cold=0;
-    try {
-      if (total>0 && _freq.values.isNotEmpty) {
-        mx=_freq.values.reduce(max); mn=_freq.values.reduce(min);
-        hot=_freq.entries.firstWhere((e)=>e.value==mx).key;
-        cold=_freq.entries.firstWhere((e)=>e.value==mn).key;
-      }
-    } catch(_) {}
-    return SingleChildScrollView(padding:const EdgeInsets.all(16),child:Column(children:[
-      // Bar guide
-      Container(padding:const EdgeInsets.all(16),decoration:BoxDecoration(color:const Color(0xFF0D1421),borderRadius:BorderRadius.circular(16),border:Border.all(color:const Color(0xFF1DE9B6).withOpacity(0.3))),
+    final sorted = _marketScores.entries.toList()
+      ..sort((a,b)=>(b.value['score'] as int).compareTo(a.value['score'] as int));
+
+    return SingleChildScrollView(padding:const EdgeInsets.all(14),child:Column(children:[
+      // Header + Scan button
+      Row(children:[
+        Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+          Text('MARKET ANALYZER',style:TextStyle(color:_accent,fontSize:13,fontWeight:FontWeight.w800,letterSpacing:1.5)),
+          Text('Find the best market to trade right now',style:TextStyle(color:_textSec,fontSize:11)),
+        ])),
+        GestureDetector(
+          onTap: _analyzing ? null : _runMultiMarketAnalysis,
+          child:AnimatedContainer(duration:const Duration(milliseconds:200),
+            padding:const EdgeInsets.symmetric(horizontal:16,vertical:10),
+            decoration:BoxDecoration(
+              color:_analyzing?_textSec.withOpacity(0.1):_accent.withOpacity(0.15),
+              borderRadius:BorderRadius.circular(12),
+              border:Border.all(color:_analyzing?_textSec:_accent)),
+            child:_analyzing
+              ? Row(mainAxisSize:MainAxisSize.min,children:[
+                  SizedBox(width:14,height:14,child:CircularProgressIndicator(strokeWidth:2,color:_accent)),
+                  const SizedBox(width:8),
+                  Text('Scanning...',style:TextStyle(color:_accent,fontSize:12,fontWeight:FontWeight.bold)),
+                ])
+              : Row(mainAxisSize:MainAxisSize.min,children:[
+                  Icon(Icons.radar,color:_accent,size:16),
+                  const SizedBox(width:6),
+                  Text('Scan All',style:TextStyle(color:_accent,fontSize:12,fontWeight:FontWeight.bold)),
+                ]),
+          ),
+        ),
+      ]),
+      const SizedBox(height:14),
+
+      // Best market highlight
+      if(_bestMarket.isNotEmpty && !_analyzing) ...[
+        Container(
+          padding:const EdgeInsets.all(14),
+          decoration:BoxDecoration(
+            gradient:LinearGradient(colors:[_green.withOpacity(0.15),_accent.withOpacity(0.08)]),
+            borderRadius:BorderRadius.circular(14),
+            border:Border.all(color:_green.withOpacity(0.5))),
+          child:Row(children:[
+            const Text('🏆',style:TextStyle(fontSize:28)),
+            const SizedBox(width:12),
+            Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+              Text('BEST MARKET RIGHT NOW',style:TextStyle(color:_green,fontSize:9,fontWeight:FontWeight.bold,letterSpacing:1.5)),
+              Text(_marketScores[_bestMarket]?['name']??_bestMarket,style:TextStyle(color:_textPrim,fontSize:16,fontWeight:FontWeight.w900)),
+              Text(_bestMarketSignal,style:TextStyle(color:_green,fontSize:11)),
+            ])),
+            GestureDetector(
+              onTap:()=>_switchMarket(_bestMarket, _marketScores[_bestMarket]?['name']??_bestMarket),
+              child:Container(padding:const EdgeInsets.symmetric(horizontal:12,vertical:8),
+                decoration:BoxDecoration(color:_green,borderRadius:BorderRadius.circular(10)),
+                child:const Text('Use',style:TextStyle(color:Colors.black,fontWeight:FontWeight.bold,fontSize:12))),
+            ),
+          ]),
+        ),
+        const SizedBox(height:14),
+      ],
+
+      // Market list
+      if(_marketScores.isEmpty && !_analyzing)
+        Container(
+          padding:const EdgeInsets.all(32),
+          decoration:BoxDecoration(color:_card,borderRadius:BorderRadius.circular(14),border:Border.all(color:_cardBorder)),
+          child:Column(children:[
+            Icon(Icons.analytics_outlined,color:_textSec,size:48),
+            const SizedBox(height:12),
+            Text('Tap "Scan All" to analyze all markets',style:TextStyle(color:_textSec,fontSize:12),textAlign:TextAlign.center),
+            const SizedBox(height:4),
+            Text('Finds the market with strongest signal',style:TextStyle(color:_textSec,fontSize:11),textAlign:TextAlign.center),
+          ]),
+        )
+      else
+        ...sorted.map((entry){
+          final m = entry.value;
+          final score = m['score'] as int;
+          final col = Color(m['color'] as int);
+          final isBest = entry.key == _bestMarket;
+          final isCurrent = entry.key == _sym;
+          return Container(
+            margin:const EdgeInsets.only(bottom:8),
+            padding:const EdgeInsets.all(12),
+            decoration:BoxDecoration(
+              color:_card,
+              borderRadius:BorderRadius.circular(12),
+              border:Border.all(color:isBest?col:isCurrent?_accent.withOpacity(0.4):_cardBorder, width:isBest?2:1),
+              boxShadow:isBest?[BoxShadow(color:col.withOpacity(0.2),blurRadius:12)]:null),
+            child:Row(children:[
+              // Score circle
+              Container(width:46,height:46,decoration:BoxDecoration(
+                shape:BoxShape.circle,
+                color:col.withOpacity(0.1),
+                border:Border.all(color:col,width:2)),
+                child:Center(child:Text('$score',style:TextStyle(color:col,fontWeight:FontWeight.w900,fontSize:14)))),
+              const SizedBox(width:12),
+              // Market info
+              Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+                Row(children:[
+                  Text(m['name'].toString(),style:TextStyle(color:_textPrim,fontWeight:FontWeight.bold,fontSize:13)),
+                  if(isBest) ...[const SizedBox(width:4),Container(padding:const EdgeInsets.symmetric(horizontal:5,vertical:2),decoration:BoxDecoration(color:_green,borderRadius:BorderRadius.circular(5)),child:const Text('BEST',style:TextStyle(color:Colors.black,fontSize:7,fontWeight:FontWeight.bold)))],
+                  if(isCurrent) ...[const SizedBox(width:4),Container(padding:const EdgeInsets.symmetric(horizontal:5,vertical:2),decoration:BoxDecoration(color:_accent.withOpacity(0.2),borderRadius:BorderRadius.circular(5),border:Border.all(color:_accent)),child:Text('NOW',style:TextStyle(color:_accent,fontSize:7,fontWeight:FontWeight.bold)))],
+                  const SizedBox(width:4),
+                  if(m['risk']!=null) Container(padding:const EdgeInsets.symmetric(horizontal:5,vertical:2),
+                    decoration:BoxDecoration(color:Color(m['riskColor']??0xFF888888).withOpacity(0.15),borderRadius:BorderRadius.circular(5),border:Border.all(color:Color(m['riskColor']??0xFF888888).withOpacity(0.5))),
+                    child:Text(m['risk'].toString(),style:TextStyle(color:Color(m['riskColor']??0xFF888888),fontSize:7,fontWeight:FontWeight.bold))),
+                ]),
+                Text(m['signal'].toString(),style:TextStyle(color:col,fontSize:11)),
+                if(m['hot']!=null) Text('Hot: ${m['hot']} (${m['hotPct']}%)  Cold: ${m['cold']}',style:TextStyle(color:_textSec,fontSize:10)),
+              ])),
+              // Signal bar
+              SizedBox(width:50,child:Column(crossAxisAlignment:CrossAxisAlignment.end,children:[
+                ClipRRect(borderRadius:BorderRadius.circular(3),
+                  child:LinearProgressIndicator(value:score/100,minHeight:6,
+                    backgroundColor:_cardBorder,
+                    valueColor:AlwaysStoppedAnimation<Color>(col))),
+                const SizedBox(height:4),
+                GestureDetector(
+                  onTap:()=>_switchMarket(entry.key, m['name'].toString()),
+                  child:Container(padding:const EdgeInsets.symmetric(horizontal:8,vertical:4),
+                    decoration:BoxDecoration(color:col.withOpacity(0.1),borderRadius:BorderRadius.circular(6),border:Border.all(color:col.withOpacity(0.5))),
+                    child:Text('Trade',style:TextStyle(color:col,fontSize:9,fontWeight:FontWeight.bold)))),
+              ])),
+            ]),
+          );
+        }).toList(),
+
+      // ── SIGNAL ANALYSIS ─────────────────────────
+      const SizedBox(height:16),
+      Container(
+        decoration:BoxDecoration(color:_card,borderRadius:BorderRadius.circular(14),border:Border.all(color:_cardBorder)),
+        padding:const EdgeInsets.all(14),
         child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
-          const Row(children:[Icon(Icons.info_outline,color:Color(0xFF1DE9B6),size:16),SizedBox(width:8),Text('WHAT DO THE BARS MEAN?',style:TextStyle(color:Color(0xFF1DE9B6),fontSize:12,fontWeight:FontWeight.bold,letterSpacing:1))]),
+          Text('SIGNAL ANALYSIS',style:TextStyle(color:_accent,fontSize:11,fontWeight:FontWeight.w800,letterSpacing:1.5)),
           const SizedBox(height:12),
-          _barHint('🟢 GREEN (Over side)','How many ticks ended with digit 5-9. Big green = trade OVER 4',const Color(0xFF00C853)),const SizedBox(height:8),
-          _barHint('🟡 YELLOW (Under side)','How many ticks ended with digit 0-4. Big yellow = trade UNDER 5',const Color(0xFFFFD700)),const SizedBox(height:8),
-          _barHint('🔵 CYAN (Even side)','How many even digits (0,2,4,6,8). Over 55% = trade ODD',const Color(0xFF1DE9B6)),const SizedBox(height:10),
-          Container(padding:const EdgeInsets.all(10),decoration:BoxDecoration(color:const Color(0xFF1A2640),borderRadius:BorderRadius.circular(8)),child:const Text('💡 When one side goes above 55% — market usually corrects back to 50/50. That correction is your trade!',style:TextStyle(color:Colors.white70,fontSize:12))),
-        ])),
-      const SizedBox(height:16),
-      if(total>=10)...[_recsCard(),const SizedBox(height:16)],
-      if(total<10) Container(margin:const EdgeInsets.only(bottom:16),padding:const EdgeInsets.all(16),decoration:BoxDecoration(color:const Color(0xFF0D1421),borderRadius:BorderRadius.circular(16),border:Border.all(color:Colors.orange.withOpacity(0.4))),
-        child:Row(children:[const Icon(Icons.hourglass_empty,color:Colors.orange,size:20),const SizedBox(width:12),Expanded(child:Text('Collecting ticks... ($total/10 minimum)',style:const TextStyle(color:Colors.orange,fontSize:12)))])),
-      _block(title:'EVEN / ODD',ll:'Even',lv:ep,lc:even,rl:'Odd',rv:100-ep,rc:total-even,lCol:const Color(0xFF1DE9B6),rCol:const Color(0xFF00C853),advice:ep>55?'🔵 Even dominant — consider ODD':(100-ep)>55?'🟢 Odd dominant — consider EVEN':'⚖️ Balanced'),
-      const SizedBox(height:16),
-      _block(title:'OVER / UNDER',ll:'Over 4',lv:op,lc:over,rl:'Under 5',rv:100-op,rc:total-over,lCol:const Color(0xFFFFD700),rCol:const Color(0xFFFF6B35),advice:op>55?'📈 High digits — OVER 4':(100-op)>55?'📉 Low digits — UNDER 5':'⚖️ Balanced'),
-      const SizedBox(height:16),
-      if(total>0) Container(padding:const EdgeInsets.all(16),decoration:BoxDecoration(color:const Color(0xFF0D1421),borderRadius:BorderRadius.circular(16),border:Border.all(color:const Color(0xFF1A2640))),
-        child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
-          const Text('DIFFERS GUIDE',style:TextStyle(color:Colors.grey,fontSize:11,letterSpacing:2)),const SizedBox(height:16),
-          Row(children:[Expanded(child:_digitBadge(hot,'HOT\nDIFFER FROM',const Color(0xFFFF4444))),const SizedBox(width:12),Expanded(child:_digitBadge(cold,'COLD\nSAFE TO USE',const Color(0xFF00C853)))]),
-        ])),
-      const SizedBox(height:16),
-      if(_hist.length>=10) _last10(),
-      const SizedBox(height:16),
-      // P&L Tracker
-      _pnlTracker(),
-      const SizedBox(height:16),
-      // Signal History
-      if(_sigHistory.isNotEmpty) _sigHistoryWidget(),
+          // Even/Odd + Over/Under stats from live data
+          Builder(builder:(_){
+            final total=_hist.length;
+            if(total<10) return Center(child:Text('Collecting data...',style:TextStyle(color:_textSec,fontSize:11)));
+            final even=_hist.where((d)=>d%2==0).length;
+            final over=_hist.where((d)=>d>4).length;
+            final ep=even/total*100; final op=over/total*100;
+            final mx=_freq.values.isEmpty?1:_freq.values.reduce(max);
+            final mn=_freq.values.isEmpty?0:_freq.values.reduce(min);
+            final hot=_freq.entries.isEmpty?0:_freq.entries.firstWhere((e)=>e.value==mx).key;
+            final cold=_freq.entries.isEmpty?9:_freq.entries.firstWhere((e)=>e.value==mn).key;
+            final hotPct=mx/total*100; final coldPct=mn/total*100;
+            return Column(children:[
+              // Even/Odd bar
+              _analysisRow('EVEN/ODD', ep, 100-ep, 'EVEN ${ep.toStringAsFixed(1)}%', 'ODD ${(100-ep).toStringAsFixed(1)}%', _green, _red,
+                ep>55?'📊 ODD recommended':ep<45?'📊 EVEN recommended':'⚖️ Balanced'),
+              const SizedBox(height:10),
+              // Over/Under bar
+              _analysisRow('OVER/UNDER', op, 100-op, 'OVER ${op.toStringAsFixed(1)}%', 'UNDER ${(100-op).toStringAsFixed(1)}%', const Color(0xFFFFD700), const Color(0xFFFF9800),
+                op>55?'📊 UNDER 5 recommended':op<45?'📊 OVER 4 recommended':'⚖️ Balanced'),
+              const SizedBox(height:12),
+              // Digit frequency bars — all 10 digits
+              const SizedBox(height:12),
+              Text('DIGIT FREQUENCY (last '+total.toString()+' ticks)',style:TextStyle(color:_textSec,fontSize:9,fontWeight:FontWeight.bold,letterSpacing:1)),
+              const SizedBox(height:8),
+              Row(mainAxisAlignment:MainAxisAlignment.spaceEvenly,children:List.generate(10,(d){
+                final pct = _freq.containsKey(d)?(_freq[d]!/total*100):10.0;
+                final isHot = d==hot; final isCold = d==cold;
+                final col = isHot?_red:isCold?_green:_accent.withOpacity(0.6);
+                return Column(children:[
+                  Text(pct.toStringAsFixed(0)+'%',style:TextStyle(color:col,fontSize:8,fontWeight:FontWeight.bold)),
+                  const SizedBox(height:3),
+                  Container(width:22,height:(pct*1.2).clamp(4.0,60.0),decoration:BoxDecoration(color:col,borderRadius:BorderRadius.circular(3))),
+                  const SizedBox(height:3),
+                  Text('$d',style:TextStyle(color:isHot||isCold?col:_textPrim,fontWeight:isHot||isCold?FontWeight.bold:FontWeight.normal,fontSize:10)),
+                  if(isHot) Text('HOT',style:TextStyle(color:_red,fontSize:7,fontWeight:FontWeight.bold)),
+                  if(isCold) Text('COLD',style:TextStyle(color:_green,fontSize:7,fontWeight:FontWeight.bold)),
+                ]);
+              })),
+              const SizedBox(height:12),
+              // Hot/Cold digit badges
+              Row(children:[
+                Expanded(child:_digitBadge(hot,'🔥 HOT\nAVOID',_red)),
+                const SizedBox(width:10),
+                Expanded(child:_digitBadge(cold,'❄️ COLD\nSAFE',_green)),
+              ]),
+            ]);
+          }),
+        ]),
+      ),
     ]));
   }
+
 
   Widget _barHint(String t,String d,Color c)=>Row(crossAxisAlignment:CrossAxisAlignment.start,children:[Container(width:4,height:36,decoration:BoxDecoration(color:c,borderRadius:BorderRadius.circular(2))),const SizedBox(width:10),Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text(t,style:TextStyle(color:c,fontSize:11,fontWeight:FontWeight.bold)),Text(d,style:const TextStyle(color:Colors.grey,fontSize:11))]))]);
 
@@ -2029,6 +2630,25 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
           ]));
       }).toList(),
     ]));
+
+  Widget _analysisRow(String label, double aVal, double bVal, String aLabel, String bLabel, Color aC, Color bC, String suggestion) {
+    return Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+      Row(mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[
+        Text(label,style:TextStyle(color:_textSec,fontSize:10,fontWeight:FontWeight.bold,letterSpacing:1)),
+        Text(suggestion,style:TextStyle(color:_accent,fontSize:10,fontWeight:FontWeight.w600)),
+      ]),
+      const SizedBox(height:5),
+      ClipRRect(borderRadius:BorderRadius.circular(4),child:Row(children:[
+        Expanded(flex:aVal.round(),child:Container(height:8,color:aC)),
+        Expanded(flex:bVal.round(),child:Container(height:8,color:bC)),
+      ])),
+      const SizedBox(height:3),
+      Row(mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[
+        Text(aLabel,style:TextStyle(color:aC,fontSize:9,fontWeight:FontWeight.bold)),
+        Text(bLabel,style:TextStyle(color:bC,fontSize:9,fontWeight:FontWeight.bold)),
+      ]),
+    ]);
+  }
 
   Widget _digitBadge(int d,String l,Color c)=>Container(padding:const EdgeInsets.all(12),decoration:BoxDecoration(color:c.withOpacity(0.08),borderRadius:BorderRadius.circular(12),border:Border.all(color:c.withOpacity(0.4))),child:Column(children:[Text('$d',style:TextStyle(color:c,fontSize:36,fontWeight:FontWeight.bold)),const SizedBox(height:4),Text(l,textAlign:TextAlign.center,style:TextStyle(color:c,fontSize:10,fontWeight:FontWeight.bold))]));
 
@@ -2063,7 +2683,7 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
     final types=['Differs','Even/Odd','Over 2','Over 3','Over 4','Over 5','Over 6','Over 7','Over 8','Under 7','Under 6','Under 5','Under 4','Under 3','Under 2','Under 1','Matches'];
     double profit=_calcPayouts[_calcType]??0, total=_calcStake+profit;
     return SingleChildScrollView(padding:const EdgeInsets.all(16),child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
-      const Text('STAKE CALCULATOR',style:TextStyle(color:Colors.white,fontSize:18,fontWeight:FontWeight.bold,letterSpacing:2)),
+      const Text('STAKE CALCULATOR',style:TextStyle(color:Colors.white,fontSize:15,fontWeight:FontWeight.bold,letterSpacing:1)),
       const SizedBox(height:4),const Text('Calculate payout before placing a trade',style:TextStyle(color:Colors.grey,fontSize:12)),const SizedBox(height:20),
       Container(padding:const EdgeInsets.all(16),decoration:BoxDecoration(color:const Color(0xFF0D1421),borderRadius:BorderRadius.circular(16),border:Border.all(color:const Color(0xFF1A2640))),
         child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
@@ -2108,34 +2728,643 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
   Widget _pBox(String l,String v,Color c)=>Column(children:[Text(l,style:const TextStyle(color:Colors.grey,fontSize:11)),const SizedBox(height:4),Text(v,style:TextStyle(color:c,fontSize:20,fontWeight:FontWeight.bold))]);
 
   // ── BOTS ────────────────────────────────────
-  Widget _bots() => SingleChildScrollView(padding:const EdgeInsets.all(16),child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
-    const Text('TRADING BOTS',style:TextStyle(color:Colors.white,fontSize:18,fontWeight:FontWeight.bold,letterSpacing:2)),
-    const SizedBox(height:4),
-    Text(_live?'Connected — bots ready':'⚠️ Connect to market first',style:TextStyle(color:_live?const Color(0xFF00C853):Colors.orange,fontSize:12)),
-    const SizedBox(height:16),
-    _botCard(id:'differs',  name:'DIFFERS BOT',   desc:'Avoids hottest digit automatically', color:const Color(0xFF1DE9B6), icon:Icons.remove_circle_outline),
-    const SizedBox(height:12),
-    _botCard(id:'evenodd',  name:'EVEN / ODD BOT', desc:'Trades opposite of dominant side',   color:const Color(0xFF00C853), icon:Icons.swap_horiz),
-    const SizedBox(height:12),
-    _botCard(id:'overunder',name:'OVER/UNDER BOT', desc:'Trades against the dominant digit side', color:const Color(0xFFFFD700), icon:Icons.trending_up),
-    const SizedBox(height:12),
-    // MATCHES warning banner
-    Container(
-      padding: const EdgeInsets.symmetric(horizontal:14, vertical:10),
-      decoration: BoxDecoration(color:const Color(0xFFFF4444).withOpacity(0.08),borderRadius:BorderRadius.circular(12),border:Border.all(color:const Color(0xFFFF4444).withOpacity(0.5))),
-      child: Row(children:[
-        const Icon(Icons.dangerous_outlined, color:Color(0xFFFF4444), size:18),
-        const SizedBox(width:10),
-        const Expanded(child:Text('MATCHES has ~10% win rate. Only 1 in 10 trades wins. Use only when a digit has not appeared in 20+ ticks.',style:TextStyle(color:Color(0xFFFF4444),fontSize:11))),
-      ])),
-    const SizedBox(height:8),
-    _botCard(id:'matches',  name:'MATCHES BOT',    desc:'⚠️ High risk — 10% win rate', color:const Color(0xFFFF4444), icon:Icons.center_focus_strong),
-    const SizedBox(height:20),
-    Container(padding:const EdgeInsets.all(14),decoration:BoxDecoration(color:const Color(0xFF0D1421),borderRadius:BorderRadius.circular(12),border:Border.all(color:Colors.orange.withOpacity(0.4))),
-      child:const Row(children:[Icon(Icons.warning_amber_rounded,color:Colors.orange,size:18),SizedBox(width:10),Expanded(child:Text('Only 1 bot at a time recommended. Bots use real funds — test on Demo first!',style:TextStyle(color:Colors.orange,fontSize:11)))])),
-  ]));
+  Widget _bots() {
+    // Compute combined stats from all bots
+    int totalRuns = _botCount.values.fold(0,(s,v)=>s+(v??0));
+    int totalWins = _botWins.values.fold(0,(s,v)=>s+(v??0));
+    int totalLost = totalRuns - totalWins;
+    double totalPnl = _botPnl.values.fold(0.0,(s,v)=>s+(v??0.0));
+    double totalStake = _tradeHistory.where((t)=>
+      ['differs','evenodd','overunder','matches'].any((b)=>
+        _botSymName[b]!=null)).fold(0.0,(s,t)=>s+(t['stake'] as double));
+    bool anyRunning = _botOn.values.any((v)=>v);
 
-  Widget _botCard({required String id,required String name,required String desc,required Color color,required IconData icon}) {
+    // Get trades from bots only (last 50)
+    final botTrades = _tradeHistory.take(50).toList();
+
+    return Column(children:[
+      // ── SMART BOT ──
+      Container(
+        color:_card,
+        padding:const EdgeInsets.fromLTRB(12,10,12,10),
+        child:Container(
+          padding:const EdgeInsets.all(12),
+          decoration:BoxDecoration(
+            gradient:LinearGradient(colors:[const Color(0xFF0D1F3C),_isDark?const Color(0xFF0D1421):Colors.white]),
+            borderRadius:BorderRadius.circular(14),
+            border:Border.all(color:_smartBotOn?_accent:_cardBorder,width:_smartBotOn?2:1),
+            boxShadow:_smartBotOn?[BoxShadow(color:_accent.withOpacity(0.2),blurRadius:16)]:null),
+          child:Column(children:[
+            Row(children:[
+              Container(width:36,height:36,decoration:BoxDecoration(
+                shape:BoxShape.circle,
+                color:_accent.withOpacity(0.15),
+                border:Border.all(color:_accent)),
+                child:const Center(child:Text('🧠',style:TextStyle(fontSize:18)))),
+              const SizedBox(width:10),
+              Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+                Text('SMART BOT',style:TextStyle(color:_accent,fontWeight:FontWeight.w900,fontSize:12,letterSpacing:1.5)),
+                Text('Auto-scans & picks best market',style:TextStyle(color:_textSec,fontSize:10)),
+              ])),
+              // Stake
+              SizedBox(width:70,child:Row(children:[
+                Expanded(child:TextField(
+                  style:TextStyle(color:_textPrim,fontSize:12),
+                  keyboardType:const TextInputType.numberWithOptions(decimal:true),
+                  decoration:InputDecoration(
+                    hintText:'1.00',hintStyle:TextStyle(color:_textSec,fontSize:11),
+                    prefixText:'\$ ',prefixStyle:TextStyle(color:_accent,fontSize:11),
+                    filled:true,fillColor:_isDark?const Color(0xFF1A2640):const Color(0xFFEEF2F7),
+                    border:OutlineInputBorder(borderRadius:BorderRadius.circular(8),borderSide:BorderSide.none),
+                    contentPadding:const EdgeInsets.symmetric(horizontal:8,vertical:6)),
+                  onChanged:(v){double? val=double.tryParse(v);if(val!=null&&val>0)setState(()=>_smartBotStake=val);},
+                )),
+              ])),
+              const SizedBox(width:8),
+              // Run/Stop
+              GestureDetector(
+                onTap:()=>_smartBotOn?setState(()=>_smartBotOn=false):_runSmartBot(),
+                child:AnimatedContainer(duration:const Duration(milliseconds:200),
+                  padding:const EdgeInsets.symmetric(horizontal:14,vertical:8),
+                  decoration:BoxDecoration(
+                    color:_smartBotOn?_red:_accent,
+                    borderRadius:BorderRadius.circular(10),
+                    boxShadow:[BoxShadow(color:(_smartBotOn?_red:_accent).withOpacity(0.4),blurRadius:10)]),
+                  child:Text(_smartBotOn?'STOP':'RUN',style:const TextStyle(color:Colors.black,fontWeight:FontWeight.w900,fontSize:12,letterSpacing:1)))),
+            ]),
+            const SizedBox(height:8),
+            // Status + stats
+            Container(padding:const EdgeInsets.symmetric(horizontal:10,vertical:7),
+              decoration:BoxDecoration(color:_isDark?const Color(0xFF0A1628):const Color(0xFFF0F4F8),borderRadius:BorderRadius.circular(8)),
+              child:Row(children:[
+                AnimatedContainer(duration:const Duration(milliseconds:300),
+                  width:7,height:7,
+                  decoration:BoxDecoration(color:_smartBotOn?_green:Colors.grey,shape:BoxShape.circle,
+                    boxShadow:_smartBotOn?[BoxShadow(color:_green.withOpacity(0.6),blurRadius:6)]:null)),
+                const SizedBox(width:8),
+                Expanded(child:Text(_smartBotMsg,style:TextStyle(color:_smartBotMsgC,fontSize:10))),
+                if(_smartBotCount>0) ...[
+                  Text('W:$_smartBotWins/$_smartBotCount',style:TextStyle(color:_green,fontSize:10,fontWeight:FontWeight.bold)),
+                  const SizedBox(width:8),
+                  Text((_smartBotPnl>=0?'+':'')+'\$'+_smartBotPnl.toStringAsFixed(2),
+                    style:TextStyle(color:_smartBotPnl>=0?_green:_red,fontSize:10,fontWeight:FontWeight.bold)),
+                ],
+              ])),
+            const SizedBox(height:8),
+            // SL/TP row
+            Row(children:[
+              // TP
+              GestureDetector(
+                onTap:()=>setState(()=>_smartBotTPon=!_smartBotTPon),
+                child:Container(padding:const EdgeInsets.symmetric(horizontal:8,vertical:5),
+                  decoration:BoxDecoration(color:_smartBotTPon?_green.withOpacity(0.15):_isDark?const Color(0xFF1A2640):const Color(0xFFEEF2F7),borderRadius:BorderRadius.circular(8),border:Border.all(color:_smartBotTPon?_green:Colors.transparent)),
+                  child:Text('TP',style:TextStyle(color:_smartBotTPon?_green:_textSec,fontSize:10,fontWeight:FontWeight.bold)))),
+              if(_smartBotTPon) ...[
+                const SizedBox(width:4),
+                GestureDetector(onTap:()=>setState((){if(_smartBotTP>0.5)_smartBotTP-=0.5;}),child:Icon(Icons.remove,color:_textSec,size:14)),
+                const SizedBox(width:4),
+                Text('\$'+_smartBotTP.toStringAsFixed(2),style:TextStyle(color:_green,fontWeight:FontWeight.bold,fontSize:11)),
+                const SizedBox(width:4),
+                GestureDetector(onTap:()=>setState(()=>_smartBotTP+=0.5),child:Icon(Icons.add,color:_green,size:14)),
+              ],
+              const SizedBox(width:12),
+              // SL
+              GestureDetector(
+                onTap:()=>setState(()=>_smartBotSLon=!_smartBotSLon),
+                child:Container(padding:const EdgeInsets.symmetric(horizontal:8,vertical:5),
+                  decoration:BoxDecoration(color:_smartBotSLon?_red.withOpacity(0.15):_isDark?const Color(0xFF1A2640):const Color(0xFFEEF2F7),borderRadius:BorderRadius.circular(8),border:Border.all(color:_smartBotSLon?_red:Colors.transparent)),
+                  child:Text('SL',style:TextStyle(color:_smartBotSLon?_red:_textSec,fontSize:10,fontWeight:FontWeight.bold)))),
+              if(_smartBotSLon) ...[
+                const SizedBox(width:4),
+                GestureDetector(onTap:()=>setState((){if(_smartBotSL>0.5)_smartBotSL-=0.5;}),child:Icon(Icons.remove,color:_textSec,size:14)),
+                const SizedBox(width:4),
+                Text('\$'+_smartBotSL.toStringAsFixed(2),style:TextStyle(color:_red,fontWeight:FontWeight.bold,fontSize:11)),
+                const SizedBox(width:4),
+                GestureDetector(onTap:()=>setState(()=>_smartBotSL+=0.5),child:Icon(Icons.add,color:_red,size:14)),
+              ],
+            ]),
+          ]),
+        ),
+      ),
+
+      // ── TOP: Bot selector pills ──
+      Container(
+        color: _card,
+        padding: const EdgeInsets.symmetric(horizontal:12, vertical:8),
+        child: SingleChildScrollView(scrollDirection:Axis.horizontal, child:Row(children:[
+          ...['differs','evenodd','overunder','matches'].map((id){
+            final names = {'differs':'DIFFERS','evenodd':'EVEN/ODD','overunder':'OVER/UNDER','matches':'MATCHES'};
+            final colors = {'differs':const Color(0xFF1DE9B6),'evenodd':const Color(0xFF00C853),'overunder':const Color(0xFFFFD700),'matches':const Color(0xFFFF4444)};
+            final on = _botOn[id]??false;
+            final sel = _botRunning == id || (_botRunning.isEmpty && id=='differs');
+            final col = colors[id]!;
+            return GestureDetector(
+              onTap:()=>setState(()=>_botRunning=id),
+              child:AnimatedContainer(
+                duration:const Duration(milliseconds:200),
+                margin:const EdgeInsets.only(right:8),
+                padding:const EdgeInsets.symmetric(horizontal:14,vertical:7),
+                decoration:BoxDecoration(
+                  color: sel ? col : col.withOpacity(0.1),
+                  borderRadius:BorderRadius.circular(20),
+                  border:Border.all(color:col, width:sel?2:1),
+                  boxShadow: on ? [BoxShadow(color:col.withOpacity(0.3),blurRadius:8)] : null),
+                child:Row(mainAxisSize:MainAxisSize.min, children:[
+                  if(on) Container(width:6,height:6,margin:const EdgeInsets.only(right:5),decoration:BoxDecoration(color:sel?Colors.black:col,shape:BoxShape.circle)),
+                  Text(names[id]!, style:TextStyle(
+                    color:sel?Colors.black:col,
+                    fontWeight:FontWeight.bold,fontSize:11)),
+                ]),
+              ),
+            );
+          }).toList(),
+        ])),
+      ),
+
+      // ── MIDDLE: Active bot detail ──
+      Expanded(child: SingleChildScrollView(padding:const EdgeInsets.all(12), child:Column(children:[
+
+        // RUN/STOP button — DBot style
+        _dbotRunButton(),
+        const SizedBox(height:12),
+
+        // Status message
+        _dbotStatusBar(),
+        const SizedBox(height:12),
+
+        // Summary / Transactions tabs
+        Container(
+          decoration:BoxDecoration(color:_card, borderRadius:BorderRadius.circular(12), border:Border.all(color:_cardBorder)),
+          child:Column(children:[
+            // Tab row
+            Row(children:[
+              Expanded(child:GestureDetector(
+                onTap:()=>setState(()=>_botTab=0),
+                child:Container(
+                  padding:const EdgeInsets.symmetric(vertical:10),
+                  decoration:BoxDecoration(
+                    border:Border(bottom:BorderSide(color:_botTab==0?_accent:Colors.transparent,width:2))),
+                  child:Center(child:Text('Summary',style:TextStyle(color:_botTab==0?_accent:_textSec,fontWeight:_botTab==0?FontWeight.bold:FontWeight.normal,fontSize:12)))),
+              )),
+              Expanded(child:GestureDetector(
+                onTap:()=>setState(()=>_botTab=1),
+                child:Container(
+                  padding:const EdgeInsets.symmetric(vertical:10),
+                  decoration:BoxDecoration(
+                    border:Border(bottom:BorderSide(color:_botTab==1?_accent:Colors.transparent,width:2))),
+                  child:Center(child:Text('Transactions',style:TextStyle(color:_botTab==1?_accent:_textSec,fontWeight:_botTab==1?FontWeight.bold:FontWeight.normal,fontSize:12)))),
+              )),
+              Expanded(child:GestureDetector(
+                onTap:()=>setState(()=>_botTab=2),
+                child:Container(
+                  padding:const EdgeInsets.symmetric(vertical:10),
+                  decoration:BoxDecoration(
+                    border:Border(bottom:BorderSide(color:_botTab==2?_accent:Colors.transparent,width:2))),
+                  child:Center(child:Text('Journal',style:TextStyle(color:_botTab==2?_accent:_textSec,fontWeight:_botTab==2?FontWeight.bold:FontWeight.normal,fontSize:12)))),
+              )),
+            ]),
+            Container(height:1,color:_cardBorder),
+
+            // Tab content
+            if(_botTab==0) _dbotSummary(totalRuns,totalWins,totalLost,totalPnl)
+            else if(_botTab==1) _dbotTransactions(botTrades)
+            else _dbotJournal(botTrades),
+            // Clear history button
+            if(botTrades.isNotEmpty) Padding(
+              padding:const EdgeInsets.fromLTRB(12,0,12,12),
+              child:GestureDetector(
+                onTap:()=>showDialog(context:context,builder:(_)=>AlertDialog(
+                  backgroundColor:_card,
+                  title:Text('Clear History',style:TextStyle(color:_textPrim)),
+                  content:Text('Clear all trade history? This cannot be undone.',style:TextStyle(color:_textSec)),
+                  actions:[
+                    TextButton(onPressed:()=>Navigator.pop(context),child:Text('Cancel',style:TextStyle(color:_textSec))),
+                    TextButton(onPressed:(){
+                      setState((){_tradeHistory.clear();_saveHistory();
+                        _smartBotCount=0;_smartBotWins=0;_smartBotPnl=0;
+                        for(final k in _botCount.keys){_botCount[k]=0;_botWins[k]=0;_botPnl[k]=0;}
+                      });
+                      Navigator.pop(context);
+                    },child:Text('Clear',style:TextStyle(color:_red,fontWeight:FontWeight.bold))),
+                  ])),
+                child:Container(width:double.infinity,padding:const EdgeInsets.symmetric(vertical:10),
+                  decoration:BoxDecoration(color:_red.withOpacity(0.08),borderRadius:BorderRadius.circular(10),border:Border.all(color:_red.withOpacity(0.4))),
+                  child:Row(mainAxisAlignment:MainAxisAlignment.center,children:[
+                    Icon(Icons.delete_outline,color:_red,size:15),
+                    const SizedBox(width:6),
+                    Text('Clear History',style:TextStyle(color:_red,fontWeight:FontWeight.bold,fontSize:12)),
+                  ])))),
+          ]),
+        ),
+        const SizedBox(height:12),
+
+        // ── SESSION CONTROLS ──
+        Container(
+          decoration: BoxDecoration(color:_card, borderRadius:BorderRadius.circular(12), border:Border.all(color:_cardBorder)),
+          padding: const EdgeInsets.all(14),
+          child: Column(crossAxisAlignment:CrossAxisAlignment.start, children:[
+            Text('SESSION CONTROLS', style:TextStyle(color:_textSec,fontSize:10,letterSpacing:1.5,fontWeight:FontWeight.bold)),
+            const SizedBox(height:12),
+
+            // Session TP
+            Row(children:[
+              Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+                Text('Session Take Profit', style:TextStyle(color:_textPrim,fontSize:12)),
+                Text('Stop all bots when P/L reaches target', style:TextStyle(color:_textSec,fontSize:10)),
+              ])),
+              const SizedBox(width:8),
+              GestureDetector(
+                onTap:()=>setState((){_sessionTPon=!_sessionTPon; if(!_sessionTPon) _sessionHit=false;}),
+                child:AnimatedContainer(duration:const Duration(milliseconds:200),
+                  width:44,height:24,
+                  decoration:BoxDecoration(color:_sessionTPon?_green:_isDark?const Color(0xFF1A2640):const Color(0xFFDDE3ED),borderRadius:BorderRadius.circular(12)),
+                  child:AnimatedAlign(duration:const Duration(milliseconds:200),
+                    alignment:_sessionTPon?Alignment.centerRight:Alignment.centerLeft,
+                    child:Container(margin:const EdgeInsets.all(2),width:20,height:20,decoration:const BoxDecoration(color:Colors.white,shape:BoxShape.circle))))),
+            ]),
+            if(_sessionTPon) ...[
+              const SizedBox(height:8),
+              Row(children:[
+                Text('Target: ', style:TextStyle(color:_textSec,fontSize:11)),
+                GestureDetector(onTap:()=>setState((){if(_sessionTP>0.5)_sessionTP=(_sessionTP-0.5);}),
+                  child:Icon(Icons.remove_circle_outline,color:_textSec,size:20)),
+                const SizedBox(width:8),
+                Text('\$${_sessionTP.toStringAsFixed(2)}',style:TextStyle(color:_green,fontWeight:FontWeight.bold,fontSize:14)),
+                const SizedBox(width:8),
+                GestureDetector(onTap:()=>setState((){_sessionTP=(_sessionTP+0.5);}),
+                  child:Icon(Icons.add_circle_outline,color:_green,size:20)),
+              ]),
+            ],
+            const SizedBox(height:12),
+
+            // Session SL
+            Row(children:[
+              Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+                Text('Session Stop Loss', style:TextStyle(color:_textPrim,fontSize:12)),
+                Text('Stop all bots when loss limit reached', style:TextStyle(color:_textSec,fontSize:10)),
+              ])),
+              const SizedBox(width:8),
+              GestureDetector(
+                onTap:()=>setState((){_sessionSLon=!_sessionSLon; if(!_sessionSLon) _sessionHit=false;}),
+                child:AnimatedContainer(duration:const Duration(milliseconds:200),
+                  width:44,height:24,
+                  decoration:BoxDecoration(color:_sessionSLon?_red:_isDark?const Color(0xFF1A2640):const Color(0xFFDDE3ED),borderRadius:BorderRadius.circular(12)),
+                  child:AnimatedAlign(duration:const Duration(milliseconds:200),
+                    alignment:_sessionSLon?Alignment.centerRight:Alignment.centerLeft,
+                    child:Container(margin:const EdgeInsets.all(2),width:20,height:20,decoration:const BoxDecoration(color:Colors.white,shape:BoxShape.circle))))),
+            ]),
+            if(_sessionSLon) ...[
+              const SizedBox(height:8),
+              Row(children:[
+                Text('Limit: ', style:TextStyle(color:_textSec,fontSize:11)),
+                GestureDetector(onTap:()=>setState((){if(_sessionSL>0.5)_sessionSL=(_sessionSL-0.5);}),
+                  child:Icon(Icons.remove_circle_outline,color:_textSec,size:20)),
+                const SizedBox(width:8),
+                Text('\$${_sessionSL.toStringAsFixed(2)}',style:TextStyle(color:_red,fontWeight:FontWeight.bold,fontSize:14)),
+                const SizedBox(width:8),
+                GestureDetector(onTap:()=>setState((){_sessionSL=(_sessionSL+0.5);}),
+                  child:Icon(Icons.add_circle_outline,color:_red,size:20)),
+              ]),
+            ],
+            const SizedBox(height:12),
+
+            // Recovery Mode
+            Row(children:[
+              Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+                Text('Recovery Mode', style:TextStyle(color:_textPrim,fontSize:12)),
+                Text('Pause after $_recoveryAfter consecutive losses', style:TextStyle(color:_textSec,fontSize:10)),
+              ])),
+              const SizedBox(width:8),
+              GestureDetector(
+                onTap:()=>setState((){_recoveryModeOn=!_recoveryModeOn;}),
+                child:AnimatedContainer(duration:const Duration(milliseconds:200),
+                  width:44,height:24,
+                  decoration:BoxDecoration(color:_recoveryModeOn?const Color(0xFFFFD700):_isDark?const Color(0xFF1A2640):const Color(0xFFDDE3ED),borderRadius:BorderRadius.circular(12)),
+                  child:AnimatedAlign(duration:const Duration(milliseconds:200),
+                    alignment:_recoveryModeOn?Alignment.centerRight:Alignment.centerLeft,
+                    child:Container(margin:const EdgeInsets.all(2),width:20,height:20,decoration:const BoxDecoration(color:Colors.white,shape:BoxShape.circle))))),
+            ]),
+            if(_recoveryModeOn) ...[
+              const SizedBox(height:8),
+              Row(children:[
+                Text('Trigger after: ', style:TextStyle(color:_textSec,fontSize:11)),
+                GestureDetector(onTap:()=>setState((){if(_recoveryAfter>1)_recoveryAfter--;}),
+                  child:Icon(Icons.remove_circle_outline,color:_textSec,size:20)),
+                const SizedBox(width:8),
+                Text('$_recoveryAfter losses',style:TextStyle(color:const Color(0xFFFFD700),fontWeight:FontWeight.bold,fontSize:14)),
+                const SizedBox(width:8),
+                GestureDetector(onTap:()=>setState((){if(_recoveryAfter<10)_recoveryAfter++;}),
+                  child:Icon(Icons.add_circle_outline,color:const Color(0xFFFFD700),size:20)),
+              ]),
+            ],
+
+            const SizedBox(height:12),
+            // Confidence threshold
+            Row(children:[
+              Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+                Text('Min Confidence',style:TextStyle(color:_textPrim,fontSize:12)),
+                Text('Only trade when signal is strong enough',style:TextStyle(color:_textSec,fontSize:10)),
+              ])),
+              const SizedBox(width:8),
+              GestureDetector(onTap:()=>setState((){if(_minConfidence>50)_minConfidence-=5;}),child:Icon(Icons.remove_circle_outline,color:_textSec,size:20)),
+              const SizedBox(width:6),
+              Text('${_minConfidence.toStringAsFixed(0)}%',style:TextStyle(color:_accent,fontWeight:FontWeight.bold,fontSize:14)),
+              const SizedBox(width:6),
+              GestureDetector(onTap:()=>setState((){if(_minConfidence<95)_minConfidence+=5;}),child:Icon(Icons.add_circle_outline,color:_accent,size:20)),
+            ]),
+            const SizedBox(height:12),
+            // Max trades per minute
+            Row(children:[
+              Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+                Text('Max Trades/min',style:TextStyle(color:_textPrim,fontSize:12)),
+                Text('Prevents overtrading — per bot',style:TextStyle(color:_textSec,fontSize:10)),
+              ])),
+              const SizedBox(width:8),
+              GestureDetector(onTap:()=>setState((){if(_maxTradesPerMin>1)_maxTradesPerMin--;}),child:Icon(Icons.remove_circle_outline,color:_textSec,size:20)),
+              const SizedBox(width:6),
+              Text('$_maxTradesPerMin',style:TextStyle(color:_accent,fontWeight:FontWeight.bold,fontSize:14)),
+              const SizedBox(width:6),
+              GestureDetector(onTap:()=>setState((){if(_maxTradesPerMin<10)_maxTradesPerMin++;}),child:Icon(Icons.add_circle_outline,color:_accent,size:20)),
+            ]),
+            const SizedBox(height:12),
+            // Volatility filter toggle
+            Row(children:[
+              Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+                Text('Volatility Filter',style:TextStyle(color:_textPrim,fontSize:12)),
+                Text('Skip trades during price spikes',style:TextStyle(color:_textSec,fontSize:10)),
+              ])),
+              const SizedBox(width:8),
+              GestureDetector(
+                onTap:()=>setState(()=>_volatilityFilter=!_volatilityFilter),
+                child:AnimatedContainer(duration:const Duration(milliseconds:200),
+                  width:44,height:24,
+                  decoration:BoxDecoration(color:_volatilityFilter?_accent:_isDark?const Color(0xFF1A2640):const Color(0xFFDDE3ED),borderRadius:BorderRadius.circular(12)),
+                  child:AnimatedAlign(duration:const Duration(milliseconds:200),
+                    alignment:_volatilityFilter?Alignment.centerRight:Alignment.centerLeft,
+                    child:Container(margin:const EdgeInsets.all(2),width:20,height:20,decoration:const BoxDecoration(color:Colors.white,shape:BoxShape.circle))))),
+            ]),
+            const SizedBox(height:12),
+            // Reset session button
+            if(_sessionHit) ...[
+              const SizedBox(height:12),
+              GestureDetector(
+                onTap:()=>setState((){_sessionHit=false;}),
+                child:Container(width:double.infinity,padding:const EdgeInsets.symmetric(vertical:8),
+                  decoration:BoxDecoration(color:_accent.withOpacity(0.1),borderRadius:BorderRadius.circular(8),border:Border.all(color:_accent.withOpacity(0.4))),
+                  child:Center(child:Text('Reset Session Limits',style:TextStyle(color:_accent,fontWeight:FontWeight.bold,fontSize:12))))),
+            ],
+          ]),
+        ),
+        const SizedBox(height:12),
+
+        // Bot settings — for selected bot
+        _botCard(
+          id: _botRunning.isEmpty?'differs':_botRunning,
+          name: {'differs':'DIFFERS BOT','evenodd':'EVEN/ODD BOT','overunder':'OVER/UNDER BOT','matches':'MATCHES BOT'}[_botRunning.isEmpty?'differs':_botRunning]!,
+          desc: {'differs':'Avoids hottest digit','evenodd':'Trades dominant side','overunder':'Trades against streak','matches':'Matches coldest digit — ⚠️ 10% win rate'}[_botRunning.isEmpty?'differs':_botRunning]!,
+          color: {'differs':const Color(0xFF1DE9B6),'evenodd':const Color(0xFF00C853),'overunder':const Color(0xFFFFD700),'matches':const Color(0xFFFF4444)}[_botRunning.isEmpty?'differs':_botRunning]!,
+          icon: {'differs':Icons.remove_circle_outline,'evenodd':Icons.swap_horiz,'overunder':Icons.trending_up,'matches':Icons.center_focus_strong}[_botRunning.isEmpty?'differs':_botRunning]!,
+        ),
+
+      ]))),
+    ]);
+  }
+
+  Widget _dbotRunButton() {
+    final id = _botRunning.isEmpty ? 'differs' : _botRunning;
+    final on = _botOn[id] ?? false;
+    final colors = {'differs':const Color(0xFF1DE9B6),'evenodd':const Color(0xFF00C853),'overunder':const Color(0xFFFFD700),'matches':const Color(0xFFFF4444)};
+    final col = colors[id]!;
+    return GestureDetector(
+      onTap: (!_live && !on) ? null : () => _toggleBot(id),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds:200),
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical:16),
+        decoration: BoxDecoration(
+          color: on ? const Color(0xFFFF4444) : _live ? col : Colors.grey.withOpacity(0.3),
+          borderRadius: BorderRadius.circular(14),
+          boxShadow: on
+            ? [BoxShadow(color:const Color(0xFFFF4444).withOpacity(0.4),blurRadius:20,spreadRadius:2)]
+            : _live ? [BoxShadow(color:col.withOpacity(0.3),blurRadius:12)] : null),
+        child: Row(mainAxisAlignment:MainAxisAlignment.center, children:[
+          Icon(on ? Icons.stop_rounded : Icons.play_arrow_rounded,
+            color: on ? Colors.white : _live ? Colors.black : Colors.grey, size:28),
+          const SizedBox(width:8),
+          Text(on ? 'STOP BOT' : 'RUN BOT',
+            style:TextStyle(color:on?Colors.white:_live?Colors.black:Colors.grey,fontWeight:FontWeight.w900,fontSize:16,letterSpacing:2)),
+        ]),
+      ),
+    );
+  }
+
+  Widget _dbotStatusBar() {
+    final id = _botRunning.isEmpty ? 'differs' : _botRunning;
+    final on = _botOn[id] ?? false;
+    final msg = _botMsg[id] ?? '';
+    final msgC = _botMsgC[id] ?? Colors.grey;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal:14, vertical:10),
+      decoration: BoxDecoration(
+        color: _isDark ? const Color(0xFF1A2640) : const Color(0xFFEEF2F7),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: on ? msgC.withOpacity(0.4) : _cardBorder)),
+      child: Row(children:[
+        AnimatedContainer(duration:const Duration(milliseconds:300),
+          width:8,height:8,
+          decoration:BoxDecoration(
+            color: on ? const Color(0xFF00C853) : Colors.grey,
+            shape:BoxShape.circle,
+            boxShadow: on ? [BoxShadow(color:const Color(0xFF00C853).withOpacity(0.6),blurRadius:6)] : null)),
+        const SizedBox(width:10),
+        Expanded(child:Text(
+          msg.isNotEmpty ? msg : (on ? 'Bot is running...' : 'Bot is not running'),
+          style:TextStyle(color:msg.isNotEmpty?msgC:_textSec, fontSize:12))),
+        if(on) SizedBox(width:14,height:14,child:CircularProgressIndicator(strokeWidth:2,color:const Color(0xFF1DE9B6))),
+      ]),
+    );
+  }
+
+  Widget _dbotSummary(int runs, int wins, int losses, double pnl) {
+    final id = _botRunning.isEmpty ? 'differs' : _botRunning;
+    final botStake = _botCount[id]!=null&&_botCount[id]!>0
+      ? (_botStake[id]??1.0) * (_botCount[id]??0) : 0.0;
+    final payout = wins * ((_botStake[id]??1.0) * 1.095);
+    return Padding(padding:const EdgeInsets.all(16),child:Column(children:[
+      Row(mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[
+        _dbotStat('Total stake', '\$${botStake.toStringAsFixed(2)}', _textSec),
+        _dbotStat('Total payout', '\$${payout.toStringAsFixed(2)}', _textSec),
+        _dbotStat('No. of runs', runs.toString(), _textSec),
+      ]),
+      const SizedBox(height:16),
+      Row(mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[
+        _dbotStat('Contracts lost', losses.toString(), _red),
+        _dbotStat('Contracts won', wins.toString(), _green),
+        _dbotStat('Total P/L', (pnl>=0?'+':'')+'\$${pnl.toStringAsFixed(2)}', pnl>=0?_green:_red),
+      ]),
+    ]));
+  }
+
+  Widget _dbotStat(String label, String value, Color color) => Column(children:[
+    Text(label, style:TextStyle(color:_textSec,fontSize:9,letterSpacing:0.5)),
+    const SizedBox(height:4),
+    Text(value, style:TextStyle(color:color,fontWeight:FontWeight.bold,fontSize:14)),
+  ]);
+
+  Widget _dbotTransactions(List<Map<String,dynamic>> trades) {
+    if(trades.isEmpty) return Padding(
+      padding:const EdgeInsets.all(24),
+      child:Center(child:Text('No transactions yet',style:TextStyle(color:_textSec,fontSize:12))));
+    return Column(children:[
+      // Download + View Detail buttons
+      Padding(padding:const EdgeInsets.fromLTRB(12,10,12,6),child:Row(children:[
+        Expanded(child:GestureDetector(
+          onTap:_downloadTransactions,
+          child:Container(padding:const EdgeInsets.symmetric(vertical:9),
+            decoration:BoxDecoration(color:_accent.withOpacity(0.08),borderRadius:BorderRadius.circular(8),border:Border.all(color:_accent.withOpacity(0.4))),
+            child:Row(mainAxisAlignment:MainAxisAlignment.center,children:[
+              Icon(Icons.download,color:_accent,size:14),const SizedBox(width:5),
+              Text('Download',style:TextStyle(color:_accent,fontSize:11,fontWeight:FontWeight.bold)),
+            ])))),
+        const SizedBox(width:8),
+        Expanded(child:GestureDetector(
+          onTap:trades.isNotEmpty?()=>_showTradeDetail(trades.first):null,
+          child:Container(padding:const EdgeInsets.symmetric(vertical:9),
+            decoration:BoxDecoration(color:_textSec.withOpacity(0.05),borderRadius:BorderRadius.circular(8),border:Border.all(color:_textSec.withOpacity(0.3))),
+            child:Row(mainAxisAlignment:MainAxisAlignment.center,children:[
+              Icon(Icons.info_outline,color:_textSec,size:14),const SizedBox(width:5),
+              Text('View Detail',style:TextStyle(color:_textSec,fontSize:11,fontWeight:FontWeight.bold)),
+            ])))),
+      ])),
+      // Headers
+      Container(color:_isDark?const Color(0xFF1A2640):const Color(0xFFEEF2F7),
+        padding:const EdgeInsets.symmetric(horizontal:12,vertical:7),
+        child:Row(children:[
+          const SizedBox(width:36),
+          Expanded(child:Text('Type',style:TextStyle(color:_textSec,fontSize:9,fontWeight:FontWeight.bold))),
+          SizedBox(width:70,child:Text('Entry/Exit',style:TextStyle(color:_textSec,fontSize:9,fontWeight:FontWeight.bold))),
+          SizedBox(width:75,child:Text('Stake & P/L',style:TextStyle(color:_textSec,fontSize:9,fontWeight:FontWeight.bold),textAlign:TextAlign.right)),
+        ])),
+      // Rows
+      ...trades.take(25).toList().asMap().entries.map((entry){
+        final i=entry.key; final t=entry.value;
+        final won=t['won'] as bool;
+        final profit=t['profit'] as double;
+        final stake=t['stake'] as double;
+        final entryS=t['entrySpot']?.toString()??'';
+        final exitS=t['exitSpot']?.toString()??'';
+        final odd=i%2==1;
+        return GestureDetector(
+          onTap:()=>_showTradeDetail(t),
+          child:Container(
+            color:odd?(_isDark?const Color(0xFF0A1628).withOpacity(0.4):const Color(0xFFF5F7FA)):Colors.transparent,
+            padding:const EdgeInsets.symmetric(horizontal:12,vertical:9),
+            child:Row(children:[
+              Container(width:32,height:32,decoration:BoxDecoration(color:(won?_green:_red).withOpacity(0.1),borderRadius:BorderRadius.circular(6)),
+                child:Icon(won?Icons.trending_up:Icons.trending_down,color:won?_green:_red,size:16)),
+              const SizedBox(width:8),
+              Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+                Text(t['type'].toString(),style:TextStyle(color:_textPrim,fontWeight:FontWeight.bold,fontSize:11)),
+                Text(t['market'].toString(),style:TextStyle(color:_textSec,fontSize:9)),
+              ])),
+              SizedBox(width:70,child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+                Row(children:[Container(width:6,height:6,decoration:BoxDecoration(color:_red,shape:BoxShape.circle)),const SizedBox(width:4),Text(entryS.isNotEmpty?entryS:t['time'].toString(),style:TextStyle(color:_textSec,fontSize:9))]),
+                const SizedBox(height:3),
+                Row(children:[Container(width:6,height:6,decoration:BoxDecoration(color:won?_green:Colors.grey,shape:BoxShape.circle,border:Border.all(color:won?_green:Colors.grey))),const SizedBox(width:4),Text(exitS.isNotEmpty?exitS:t['time'].toString(),style:TextStyle(color:_textSec,fontSize:9))]),
+              ])),
+              SizedBox(width:75,child:Column(crossAxisAlignment:CrossAxisAlignment.end,children:[
+                Text('\$'+stake.toStringAsFixed(2),style:TextStyle(color:_textPrim,fontWeight:FontWeight.bold,fontSize:11)),
+                Text((profit>=0?'+':'')+'\$'+profit.toStringAsFixed(2),style:TextStyle(color:won?_green:_red,fontSize:11,fontWeight:FontWeight.bold)),
+              ])),
+            ]),
+          ),
+        );
+      }).toList(),
+    ]);
+  }
+
+
+  Widget _dbotJournal(List<Map<String,dynamic>> trades) {
+    if(trades.isEmpty) return Padding(
+      padding:const EdgeInsets.all(24),
+      child:Center(child:Text('No journal entries yet',style:TextStyle(color:_textSec,fontSize:12))));
+    return Column(children:[
+      Padding(padding:const EdgeInsets.all(12),child:Row(children:[
+        Icon(Icons.book_outlined,color:_accent,size:14),const SizedBox(width:6),
+        Text('${trades.length} trades recorded',style:TextStyle(color:_textSec,fontSize:11)),
+        const Spacer(),
+        Text((_pnl>=0?'+':'')+'\$'+_pnl.toStringAsFixed(2),style:TextStyle(color:_pnl>=0?_green:_red,fontWeight:FontWeight.bold,fontSize:11)),
+      ])),
+      Container(height:1,color:_cardBorder),
+      ...trades.take(20).map((t){
+        final won=t['won'] as bool;
+        final profit=t['profit'] as double;
+        final stake=t['stake'] as double;
+        final entryS=t['entrySpot']?.toString()??'';
+        final exitS=t['exitSpot']?.toString()??'';
+        return GestureDetector(
+          onTap:()=>_showTradeDetail(t),
+          child:Container(
+            padding:const EdgeInsets.symmetric(horizontal:12,vertical:10),
+            child:Row(children:[
+              SizedBox(width:50,child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+                Text(t['time'].toString().length>=5?t['time'].toString().substring(0,5):t['time'].toString(),style:TextStyle(color:_textSec,fontSize:10,fontWeight:FontWeight.bold)),
+                const SizedBox(height:2),
+                Container(padding:const EdgeInsets.symmetric(horizontal:4,vertical:2),
+                  decoration:BoxDecoration(color:(won?_green:_red).withOpacity(0.1),borderRadius:BorderRadius.circular(4)),
+                  child:Text(won?'WIN':'LOSS',style:TextStyle(color:won?_green:_red,fontSize:8,fontWeight:FontWeight.bold))),
+              ])),
+              const SizedBox(width:8),
+              Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+                Text(t['type'].toString(),style:TextStyle(color:_textPrim,fontSize:11,fontWeight:FontWeight.bold)),
+                Text(t['market'].toString(),style:TextStyle(color:_textSec,fontSize:9)),
+                if(entryS.isNotEmpty) Text('Entry: $entryS  Exit: $exitS',style:TextStyle(color:_textSec,fontSize:9)),
+              ])),
+              Column(crossAxisAlignment:CrossAxisAlignment.end,children:[
+                Text('\$'+stake.toStringAsFixed(2),style:TextStyle(color:_textSec,fontSize:10)),
+                Text((profit>=0?'+':'')+'\$'+profit.toStringAsFixed(2),style:TextStyle(color:won?_green:_red,fontSize:12,fontWeight:FontWeight.w900)),
+              ]),
+            ]),
+          ),
+        );
+      }).toList(),
+    ]);
+  }
+
+  void _showTradeDetail(Map<String,dynamic> t) {
+    final won=t['won'] as bool;
+    final profit=t['profit'] as double;
+    final entryS=t['entrySpot']?.toString()??'';
+    final exitS=t['exitSpot']?.toString()??'';
+    showDialog(context:context,builder:(_)=>AlertDialog(
+      backgroundColor:_card,
+      shape:RoundedRectangleBorder(borderRadius:BorderRadius.circular(16),side:BorderSide(color:won?_green:_red)),
+      title:Row(children:[
+        Icon(won?Icons.check_circle:Icons.cancel,color:won?_green:_red,size:20),
+        const SizedBox(width:8),
+        Text(won?'Trade Won':'Trade Lost',style:TextStyle(color:won?_green:_red,fontSize:15,fontWeight:FontWeight.bold)),
+      ]),
+      content:Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:[
+        _detailRow('Type',t['type'].toString()),
+        _detailRow('Market',t['market'].toString()),
+        _detailRow('Time',t['time'].toString()),
+        _detailRow('Stake','\$'+(t['stake'] as double).toStringAsFixed(2)),
+        _detailRow('P/L',(profit>=0?'+':'')+'\$'+profit.toStringAsFixed(2)),
+        if(entryS.isNotEmpty) _detailRow('Entry Spot',entryS),
+        if(exitS.isNotEmpty)  _detailRow('Exit Spot',exitS),
+      ]),
+      actions:[TextButton(onPressed:()=>Navigator.pop(context),child:Text('Close',style:TextStyle(color:_accent)))],
+    ));
+  }
+
+  Widget _detailRow(String label,String value)=>Padding(
+    padding:const EdgeInsets.symmetric(vertical:4),
+    child:Row(mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[
+      Text(label,style:TextStyle(color:_textSec,fontSize:12)),
+      Text(value,style:TextStyle(color:_textPrim,fontWeight:FontWeight.bold,fontSize:12)),
+    ]));
+
+    Widget _botCard({required String id,required String name,required String desc,required Color color,required IconData icon}) {
     bool on=_botOn[id]??false; bool busy=_botBusy[id]??false;
     int count=_botCount[id]??0; int wins=_botWins[id]??0; double pnl=_botPnl[id]??0;
     double stake=_botStake[id]??1.0; int maxT=_botMax[id]??10;
@@ -2210,45 +3439,10 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
           if(!on) _botToggle('Signal Link','Wait for SOET signal before each trade',Icons.bolt,const Color(0xFF1DE9B6),_botSigLink[id]??false,()=>setState(()=>_botSigLink[id]=!(_botSigLink[id]??false))),
           if(!on&&(_botSigLink[id]??false)) const SizedBox(height:6),
           if(!on&&(_botSigLink[id]??false)) Container(padding:const EdgeInsets.all(8),decoration:BoxDecoration(color:const Color(0xFF1DE9B6).withOpacity(0.05),borderRadius:BorderRadius.circular(8)),child:Row(children:[const Icon(Icons.info_outline,color:Color(0xFF1DE9B6),size:13),const SizedBox(width:6),Expanded(child:Text('Signal: $_signal',style:const TextStyle(color:Color(0xFF1DE9B6),fontSize:11)))])),
-          if(!on) const SizedBox(height:8),
-          // ── SCHEDULER ──
-          if(!on) _botToggle('Scheduler','Trade only at certain hours',Icons.schedule,const Color(0xFFFFD700),_botScheduleOn[id]??false,()=>setState(()=>_botScheduleOn[id]=!(_botScheduleOn[id]??false))),
-          if(!on&&(_botScheduleOn[id]??false))...[
-            const SizedBox(height:8),
-            Container(padding:const EdgeInsets.all(12),decoration:BoxDecoration(color:const Color(0xFFFFD700).withOpacity(0.05),borderRadius:BorderRadius.circular(10),border:Border.all(color:const Color(0xFFFFD700).withOpacity(0.2))),
-              child:Column(children:[
-                Row(children:[
-                  const Icon(Icons.play_circle_outline,color:Color(0xFF00C853),size:14),
-                  const SizedBox(width:6),
-                  const Text('Start hour',style:TextStyle(color:Colors.grey,fontSize:11)),
-                  const Spacer(),
-                  GestureDetector(onTap:()=>setState((){if((_botStartHour[id]??8)>0)_botStartHour[id]=(_botStartHour[id]??8)-1;}),child:const Icon(Icons.remove_circle_outline,color:Colors.grey,size:18)),
-                  const SizedBox(width:8),
-                  Text('${(_botStartHour[id]??8).toString().padLeft(2,'0')}:00',style:const TextStyle(color:Colors.white,fontWeight:FontWeight.bold,fontSize:13)),
-                  const SizedBox(width:8),
-                  GestureDetector(onTap:()=>setState((){if((_botStartHour[id]??8)<23)_botStartHour[id]=(_botStartHour[id]??8)+1;}),child:const Icon(Icons.add_circle_outline,color:Color(0xFF00C853),size:18)),
-                ]),
-                const SizedBox(height:8),
-                Row(children:[
-                  const Icon(Icons.stop_circle_outlined,color:Color(0xFFFF4444),size:14),
-                  const SizedBox(width:6),
-                  const Text('Stop hour',style:TextStyle(color:Colors.grey,fontSize:11)),
-                  const Spacer(),
-                  GestureDetector(onTap:()=>setState((){if((_botStopHour[id]??17)>0)_botStopHour[id]=(_botStopHour[id]??17)-1;}),child:const Icon(Icons.remove_circle_outline,color:Colors.grey,size:18)),
-                  const SizedBox(width:8),
-                  Text('${(_botStopHour[id]??17).toString().padLeft(2,'0')}:00',style:const TextStyle(color:Colors.white,fontWeight:FontWeight.bold,fontSize:13)),
-                  const SizedBox(width:8),
-                  GestureDetector(onTap:()=>setState((){if((_botStopHour[id]??17)<23)_botStopHour[id]=(_botStopHour[id]??17)+1;}),child:const Icon(Icons.add_circle_outline,color:Color(0xFF00C853),size:18)),
-                ]),
-                const SizedBox(height:8),
-                Text('Bot trades only between ${(_botStartHour[id]??8).toString().padLeft(2,'0')}:00 – ${(_botStopHour[id]??17).toString().padLeft(2,'0')}:00',
-                  style:const TextStyle(color:Color(0xFFFFD700),fontSize:10),textAlign:TextAlign.center),
-              ])),
-          ],
         ])),
 
         // Live stats — show when running or has trades
-        if(on||count>0)...[
+        if(on||count>0) ...[
           Container(height:1,color:color.withOpacity(0.15)),
           Padding(padding:const EdgeInsets.all(12),child:Column(children:[
             // Stats row
@@ -2261,7 +3455,7 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
             ]),
             if(count>0) const SizedBox(height:8),
             // Progress bar
-            if(on)...[
+            if(on) ...[
               ClipRRect(borderRadius:BorderRadius.circular(4),child:LinearProgressIndicator(value:count/maxT,minHeight:4,backgroundColor:color.withOpacity(0.15),valueColor:AlwaysStoppedAnimation<Color>(color))),
               const SizedBox(height:8),
             ],
@@ -2307,7 +3501,7 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
 
   // ── GUIDE ───────────────────────────────────
   Widget _guide()=>SingleChildScrollView(padding:const EdgeInsets.all(16),child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
-    const Text('SOET GUIDE',style:TextStyle(color:Colors.white,fontSize:18,fontWeight:FontWeight.bold,letterSpacing:2)),
+    const Text('SOET GUIDE',style:TextStyle(color:Colors.white,fontSize:15,fontWeight:FontWeight.bold,letterSpacing:1)),
     const SizedBox(height:4),const Text('Everything you need to know about Deriv trading',style:TextStyle(color:Colors.grey,fontSize:12)),const SizedBox(height:20),
     _gSection('📊 TRADE TYPES',const Color(0xFF1DE9B6),[
       _gItem('DIFFERS','Last digit will NOT be your chosen number. Example: Differ from 5 = win if last digit is anything except 5.\nPayout ~9.5%. Low risk.\n💡 Use when one digit appears too often.'),
@@ -2365,7 +3559,7 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
           const Text('Smart Options & Events Trader',style:TextStyle(color:Color(0xFF1DE9B6),fontSize:12)),
           const SizedBox(height:8),
           Container(padding:const EdgeInsets.symmetric(horizontal:16,vertical:6),decoration:BoxDecoration(color:ac.withOpacity(0.1),borderRadius:BorderRadius.circular(20),border:Border.all(color:ac.withOpacity(0.4))),child:Text('${widget.isDemo?"DEMO":"LIVE"} • $_currency $_balance',style:TextStyle(color:ac,fontWeight:FontWeight.bold,fontSize:14))),
-          if(_loginId.isNotEmpty)...[const SizedBox(height:6),Text('Account: $_loginId',style:const TextStyle(color:Colors.grey,fontSize:11))],
+          if(_loginId.isNotEmpty) ...[const SizedBox(height:6),Text('Account: $_loginId',style:const TextStyle(color:Colors.grey,fontSize:11))],
           const SizedBox(height:16),
           GestureDetector(onTap:_logout,child:Container(padding:const EdgeInsets.symmetric(horizontal:20,vertical:8),decoration:BoxDecoration(color:const Color(0xFFFF4444).withOpacity(0.1),borderRadius:BorderRadius.circular(20),border:Border.all(color:const Color(0xFFFF4444).withOpacity(0.4))),child:const Row(mainAxisSize:MainAxisSize.min,children:[Icon(Icons.logout,color:Color(0xFFFF4444),size:16),SizedBox(width:6),Text('Disconnect & Logout',style:TextStyle(color:Color(0xFFFF4444),fontSize:12))]))),
         ])),
@@ -2378,13 +3572,10 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
           {'l':'Best Streak', 'v':'$_streak',  'h':'FFFF6B35'},
         ].map((s){Color c=Color(int.parse(s['h']!,radix:16));return Container(padding:const EdgeInsets.all(16),decoration:BoxDecoration(color:const Color(0xFF0D1421),borderRadius:BorderRadius.circular(12),border:Border.all(color:c.withOpacity(0.3))),child:Column(crossAxisAlignment:CrossAxisAlignment.start,mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[Text(s['l']!,style:const TextStyle(color:Colors.grey,fontSize:11)),Text(s['v']!,style:TextStyle(color:c,fontSize:22,fontWeight:FontWeight.bold))]));}).toList()),
       const SizedBox(height:20),
-      _sigHistoryWidget(),
-      const SizedBox(height:20),
       _telegramSection(),
       const SizedBox(height:20),
       _firebaseSection(),
-      const SizedBox(height:20),
-      _tradeHistoryWidget(),
+
     ]));
   }
 
@@ -2705,107 +3896,140 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
 
   // ── TRADE HISTORY WIDGET ────────────────────
   Widget _tradeHistoryWidget() {
-    if (_tradeHistory.isEmpty) {
-      return Container(
-        padding: const EdgeInsets.all(32),
-        decoration: BoxDecoration(color: const Color(0xFF0D1421), borderRadius: BorderRadius.circular(16), border: Border.all(color: const Color(0xFF1A2640))),
-        child: const Center(child: Column(children: [
-          Icon(Icons.history, color: Colors.grey, size:40),
-          SizedBox(height:8),
-          Text('No trades yet this session', style: TextStyle(color: Colors.grey)),
-          Text('Place a trade to see history here', style: TextStyle(color: Colors.grey, fontSize:12)),
-        ])),
-      );
-    }
-
-    // Stats summary
+    // Compute stats
     final totalTrades = _tradeHistory.length;
-    final wins = _tradeHistory.where((t) => t['won'] == true).length;
-    final winRate = totalTrades > 0 ? wins / totalTrades * 100 : 0.0;
-    final totalPnl = _tradeHistory.fold(0.0, (s, t) => s + (t['profit'] as double));
-    final bestTrade = _tradeHistory.reduce((a,b) => (a['profit'] as double) > (b['profit'] as double) ? a : b);
-    final worstTrade = _tradeHistory.reduce((a,b) => (a['profit'] as double) < (b['profit'] as double) ? a : b);
+    final wins = _tradeHistory.where((t) => t['won']==true).length;
+    final losses = totalTrades - wins;
+    final totalStake = _tradeHistory.fold(0.0,(s,t)=>s+(t['stake'] as double));
+    final totalPayout = _tradeHistory.fold(0.0,(s,t){
+      final p = t['profit'] as double;
+      final st = t['stake'] as double;
+      return s + (t['won']==true ? st+p : 0.0);
+    });
+    final totalPnl = _tradeHistory.fold(0.0,(s,t)=>s+(t['profit'] as double));
 
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      // Stats summary row
-      const Text('SESSION STATS', style: TextStyle(color: Colors.grey, fontSize: 11, letterSpacing:2)),
-      const SizedBox(height: 10),
-      Row(children: [
-        _statBox('Trades', '$totalTrades', const Color(0xFF1DE9B6)),
-        const SizedBox(width: 8),
-        _statBox('Win Rate', '${winRate.toStringAsFixed(1)}%', winRate >= 50 ? const Color(0xFF00C853) : const Color(0xFFFF4444)),
-        const SizedBox(width: 8),
-        _statBox('P&L', '${totalPnl >= 0 ? "+" : ""}\$${totalPnl.toStringAsFixed(2)}', totalPnl >= 0 ? const Color(0xFF00C853) : const Color(0xFFFF4444)),
-      ]),
-      const SizedBox(height: 8),
-      Row(children: [
-        _statBox('Best', '+\$${(bestTrade['profit'] as double).abs().toStringAsFixed(2)}', const Color(0xFF00C853)),
-        const SizedBox(width: 8),
-        _statBox('Worst', '-\$${(worstTrade['profit'] as double).abs().toStringAsFixed(2)}', const Color(0xFFFF4444)),
-        const SizedBox(width: 8),
-        _statBox('Wins', '$wins / $totalTrades', const Color(0xFFFFD700)),
-      ]),
-      const SizedBox(height: 16),
+    return Container(
+      decoration: BoxDecoration(color:_card, borderRadius:BorderRadius.circular(16), border:Border.all(color:_cardBorder)),
+      child: Column(children:[
+        // Header
+        Padding(padding:const EdgeInsets.fromLTRB(16,14,16,10),child:Row(children:[
+          Icon(Icons.receipt_long, color:_accent, size:16),
+          const SizedBox(width:8),
+          Text('TRANSACTIONS', style:TextStyle(color:_textPrim,fontWeight:FontWeight.bold,fontSize:13,letterSpacing:1)),
+          const Spacer(),
+          // Download button
+          GestureDetector(
+            onTap: _downloadTransactions,
+            child: Container(
+              padding:const EdgeInsets.symmetric(horizontal:10,vertical:5),
+              decoration:BoxDecoration(color:_accent.withOpacity(0.1),borderRadius:BorderRadius.circular(8),border:Border.all(color:_accent.withOpacity(0.4))),
+              child:Row(mainAxisSize:MainAxisSize.min,children:[
+                Icon(Icons.download, color:_accent, size:13),
+                const SizedBox(width:4),
+                Text('Download', style:TextStyle(color:_accent,fontSize:11,fontWeight:FontWeight.bold)),
+              ]),
+            ),
+          ),
+        ])),
+        Container(height:1,color:_cardBorder),
 
-      // History header
-      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-        const Text('TRADE HISTORY', style: TextStyle(color: Colors.grey, fontSize: 11, letterSpacing:2)),
-        GestureDetector(
-          onTap: () => setState(() => _tradeHistory.clear()),
-          child: Container(padding: const EdgeInsets.symmetric(horizontal:10, vertical:4),
-            decoration: BoxDecoration(color: const Color(0xFFFF4444).withOpacity(0.1), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFFF4444).withOpacity(0.3))),
-            child: const Text('Clear', style: TextStyle(color: Color(0xFFFF4444), fontSize: 11))),
-        ),
-      ]),
-      const SizedBox(height: 8),
-
-      // Trade list
-      Container(decoration: BoxDecoration(color: const Color(0xFF0D1421), borderRadius: BorderRadius.circular(16), border: Border.all(color: const Color(0xFF1A2640))),
-        child: Column(children: [
-          // Header row
-          Container(padding: const EdgeInsets.symmetric(horizontal:12, vertical:8),
-            decoration: const BoxDecoration(color: Color(0xFF1A2640), borderRadius: BorderRadius.only(topLeft: Radius.circular(16), topRight: Radius.circular(16))),
-            child: Row(children: const [
-              SizedBox(width:50, child: Text('Time', style: TextStyle(color: Colors.grey, fontSize:10, fontWeight: FontWeight.bold))),
-              SizedBox(width:8),
-              Expanded(child: Text('Market', style: TextStyle(color: Colors.grey, fontSize:10, fontWeight: FontWeight.bold))),
-              SizedBox(width:8),
-              SizedBox(width:55, child: Text('Type', style: TextStyle(color: Colors.grey, fontSize:10, fontWeight: FontWeight.bold))),
-              SizedBox(width:8),
-              SizedBox(width:45, child: Text('Stake', style: TextStyle(color: Colors.grey, fontSize:10, fontWeight: FontWeight.bold))),
-              SizedBox(width:8),
-              SizedBox(width:55, child: Text('Result', style: TextStyle(color: Colors.grey, fontSize:10, fontWeight: FontWeight.bold, overflow: TextOverflow.clip))),
-            ])),
-          // Trade rows
-          ...(_tradeHistory.take(50).toList().asMap().entries.map((entry) {
+        if (_tradeHistory.isEmpty)
+          Padding(padding:const EdgeInsets.all(24),child:Center(child:Text('No trades yet',style:TextStyle(color:_textSec))))
+        else ...[
+          // Transaction rows
+          ..._tradeHistory.take(30).toList().asMap().entries.map((entry){
             final i = entry.key;
             final t = entry.value;
             final won = t['won'] as bool;
             final profit = t['profit'] as double;
-            final c = won ? const Color(0xFF00C853) : const Color(0xFFFF4444);
+            final stake = t['stake'] as double;
+            final payout = won ? stake + profit : 0.0;
+            final odd = i % 2 == 1;
             return Container(
-              padding: const EdgeInsets.symmetric(horizontal:12, vertical:8),
-              decoration: BoxDecoration(
-                color: i % 2 == 0 ? Colors.transparent : const Color(0xFF0A0F1E),
-                border: const Border(bottom: BorderSide(color: Color(0xFF1A2640), width: 0.5)),
-              ),
-              child: Row(children: [
-                SizedBox(width:50, child: Text(t['time'], style: const TextStyle(color: Colors.grey, fontSize:10))),
-                const SizedBox(width:8),
-                Expanded(child: Text(t['market'], style: const TextStyle(color: Colors.white70, fontSize:10), overflow: TextOverflow.ellipsis)),
-                const SizedBox(width:8),
-                SizedBox(width:55, child: Text(t['type'], style: TextStyle(color: const Color(0xFF1DE9B6), fontSize:10), overflow: TextOverflow.ellipsis)),
-                const SizedBox(width:8),
-                SizedBox(width:45, child: Text('\$${(t['stake'] as double).toStringAsFixed(2)}', style: const TextStyle(color: Colors.white70, fontSize:10))),
-                const SizedBox(width:8),
-                SizedBox(width:55, child: Text('${won ? "✅ +" : "❌ -"}\$${profit.abs().toStringAsFixed(2)}', style: TextStyle(color: c, fontSize:10, fontWeight: FontWeight.bold))),
+              color: odd ? (_isDark ? const Color(0xFF0A1628).withOpacity(0.5) : const Color(0xFFF8FAFC)) : Colors.transparent,
+              padding:const EdgeInsets.symmetric(horizontal:16, vertical:10),
+              child:Row(children:[
+                // Type icon
+                Container(width:36,height:36,decoration:BoxDecoration(
+                  color:(won?_green:_red).withOpacity(0.1),
+                  borderRadius:BorderRadius.circular(8)),
+                  child:Icon(won?Icons.trending_up:Icons.trending_down, color:won?_green:_red, size:18)),
+                const SizedBox(width:10),
+                // Entry/Exit spot + type
+                Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+                  Text(t['type'].toString(), style:TextStyle(color:_textPrim,fontWeight:FontWeight.bold,fontSize:12)),
+                  Text(t['market'].toString(), style:TextStyle(color:_textSec,fontSize:10)),
+                  const SizedBox(height:2),
+                  Row(children:[
+                    Container(width:8,height:8,decoration:BoxDecoration(color:_red,shape:BoxShape.circle)),
+                    const SizedBox(width:4),
+                    Text(t['time'].toString(), style:TextStyle(color:_textSec,fontSize:10)),
+                    const SizedBox(width:4),
+                    Container(width:8,height:8,decoration:BoxDecoration(color:won?_green:Colors.grey,shape:BoxShape.circle)),
+                    const SizedBox(width:4),
+                    Text(t['time'].toString(), style:TextStyle(color:_textSec,fontSize:10)),
+                  ]),
+                ])),
+                // Buy price and P/L
+                Column(crossAxisAlignment:CrossAxisAlignment.end,children:[
+                  Text('\$'+stake.toStringAsFixed(2), style:TextStyle(color:_textPrim,fontWeight:FontWeight.bold,fontSize:12)),
+                  Text((profit>=0?'+':'')+'\$'+profit.toStringAsFixed(2),
+                    style:TextStyle(color:won?_green:_red, fontSize:12, fontWeight:FontWeight.bold)),
+                ]),
               ]),
             );
-          })).toList(),
-        ]),
-      ),
-    ]);
+          }).toList(),
+
+          // Summary bar — like DBot
+          Container(
+            margin:const EdgeInsets.all(12),
+            padding:const EdgeInsets.all(14),
+            decoration:BoxDecoration(color:_isDark?const Color(0xFF1A2640):const Color(0xFFF0F4F8),borderRadius:BorderRadius.circular(12)),
+            child:Column(children:[
+              Row(mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[
+                _txStat('Total stake', '\$'+totalStake.toStringAsFixed(2), _textSec),
+                _txStat('Total payout', '\$'+totalPayout.toStringAsFixed(2), _textSec),
+                _txStat('No. of runs', totalTrades.toString(), _textSec),
+              ]),
+              const SizedBox(height:10),
+              Row(mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[
+                _txStat('Contracts lost', losses.toString(), _red),
+                _txStat('Contracts won', wins.toString(), _green),
+                _txStat('Total P/L', (totalPnl>=0?'+':'')+'\$'+totalPnl.toStringAsFixed(2), totalPnl>=0?_green:_red),
+              ]),
+            ]),
+          ),
+
+          // Reset button
+          Padding(padding:const EdgeInsets.fromLTRB(12,0,12,12),child:GestureDetector(
+            onTap:()=>setState((){_tradeHistory.clear();_saveHistory();}),
+            child:Container(width:double.infinity,padding:const EdgeInsets.symmetric(vertical:10),
+              decoration:BoxDecoration(color:_red.withOpacity(0.1),borderRadius:BorderRadius.circular(10),border:Border.all(color:_red.withOpacity(0.4))),
+              child:Center(child:Text('Reset',style:TextStyle(color:_red,fontWeight:FontWeight.bold,fontSize:13)))),
+          )),
+        ],
+      ]),
+    );
   }
+
+  Widget _txStat(String label, String value, Color color) => Column(children:[
+    Text(label, style:TextStyle(color:_textSec,fontSize:9,letterSpacing:0.5)),
+    const SizedBox(height:3),
+    Text(value, style:TextStyle(color:color,fontWeight:FontWeight.bold,fontSize:13)),
+  ]);
+
+  void _downloadTransactions() {
+    if (_tradeHistory.isEmpty) return;
+    // Build CSV content
+    final lines = ['Time,Market,Type,Stake,Won,Profit'];
+    for (final t in _tradeHistory) {
+      lines.add('${t['time']},${t['market']},${t['type']},${t['stake']},${t['won']},${t['profit']}');
+    }
+    final csv = lines.join('\n');
+    // Trigger download via JS
+    html.window.postMessage('soet_download:trades.csv:' + csv, '*');
+  }
+
 
   Widget _statBox(String label, String value, Color color) => Expanded(
     child: Container(padding: const EdgeInsets.all(10),
@@ -2823,20 +4047,37 @@ class _HomeState extends State<SOETHome> with TickerProviderStateMixin {
     final items=[
       {'i':Icons.dashboard_rounded,'l':'Dashboard'},
       {'i':Icons.analytics_rounded,'l':'Analyzer'},
-      {'i':Icons.calculate_rounded,'l':'Calculator'},
+      {'i':Icons.calculate_rounded,'l':'Calc'},
       {'i':Icons.smart_toy_rounded,'l':'Bots'},
-      {'i':Icons.menu_book_rounded,'l':'Guide'},
       {'i':Icons.person_rounded,   'l':'Profile'},
     ];
-    return Container(padding:const EdgeInsets.symmetric(vertical:8),decoration:const BoxDecoration(color:Color(0xFF0D1421),border:Border(top:BorderSide(color:Color(0xFF1A2640)))),
-      child:Row(mainAxisAlignment:MainAxisAlignment.spaceAround,children:List.generate(items.length,(i){
+    return Container(
+      decoration:BoxDecoration(
+        color:_card,
+        border:Border(bottom:BorderSide(color:_cardBorder))),
+      child:Row(children:List.generate(items.length,(i){
         bool sel=_tab==i;
-        return GestureDetector(onTap:()=>setState(()=>_tab=i),child:Column(mainAxisSize:MainAxisSize.min,children:[
-          Icon(items[i]['i'] as IconData,color:sel?const Color(0xFF1DE9B6):Colors.grey,size:22),
-          const SizedBox(height:3),
-          Text(items[i]['l'] as String,style:TextStyle(color:sel?const Color(0xFF1DE9B6):Colors.grey,fontSize:9)),
-          if(sel) Container(margin:const EdgeInsets.only(top:2),width:4,height:4,decoration:const BoxDecoration(color:Color(0xFF1DE9B6),shape:BoxShape.circle)),
-        ]));
-      })));
+        return Expanded(child:GestureDetector(
+          onTap:()=>setState(()=>_tab=i),
+          child:Container(
+            padding:const EdgeInsets.symmetric(vertical:8),
+            decoration:BoxDecoration(
+              border:Border(bottom:BorderSide(
+                color:sel?const Color(0xFF1DE9B6):Colors.transparent,
+                width:2.5))),
+            child:Column(mainAxisSize:MainAxisSize.min,children:[
+              Icon(items[i]['i'] as IconData,
+                color:sel?const Color(0xFF1DE9B6):_textSec,size:18),
+              const SizedBox(height:2),
+              Text(items[i]['l'] as String,
+                style:TextStyle(
+                  color:sel?const Color(0xFF1DE9B6):_textSec,
+                  fontSize:9,
+                  fontWeight:sel?FontWeight.bold:FontWeight.normal)),
+            ]),
+          ),
+        ));
+      })),
+    );
   }
 }
